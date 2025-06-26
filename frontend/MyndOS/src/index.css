@@ -1,0 +1,68 @@
+/* Import Tailwind base styles */
+@import 'tailwindcss/base';
+@import 'tailwindcss/components';
+@import 'tailwindcss/utilities';
+
+@layer base {
+  body {
+    background-image: linear-gradient(to bottom right, var(--primary-light), var(--secondary-light));
+    min-height: 100vh;
+    color: #1f2937; /* text-gray-800 */
+  }
+}
+
+@layer components {
+  .glass-card {
+    background-color: rgba(255, 255, 255, 0.8);
+    backdrop-filter: blur(12px);
+    border-radius: 0.75rem;
+    box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+  }
+  
+  .btn {
+    padding: 1.5rem 0.75rem;
+    border-radius: 9999px;
+    font-weight: 600;
+    transition: all 300ms ease-in-out;
+    &:focus {
+      outline: none;
+      outline-width: 2px;
+      --ring-offset: 2px;
+    }
+  }
+  
+  .btn-primary {
+    background-image: linear-gradient(to right, var(--primary-light), var(--secondary));
+    padding: 1.5rem 0.75rem;
+    border-radius: 9999px;
+    font-weight: 600;
+    color: white;
+    transition: all 300ms ease-in-out;
+  }
+  
+  .btn-secondary {
+    background-color: #4B5563;
+    color: white;
+    &:hover {
+      background-color: #374151;
+      box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+      transform: translateY(-0.25rem);
+    }
+    &:focus {
+      --ring-color: #6B7280;
+    }
+  }
+  
+  .btn-success {
+    background-color: #16a34a;
+    color: white;
+    &:hover {
+      background-color: #15803d;
+      box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+      transform: translateY(-0.25rem);
+    }
+    &:focus {
+      --ring-color: #22c55e;
+    }
+  }
+}
