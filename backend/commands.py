@@ -1,19 +1,28 @@
 import subprocess
+import webbrowser
 
-async def execute_intent(command: str):
-    print(f"[intent] Interpreted Command: {command}")
+from tts import TTS
 
-    if "notepad" in command:
-        await run_via_cmd("start notepad")
-    elif "calculator" in command:
-        await run_via_cmd("start calc")
-    elif "paint" in command:
-        await run_via_cmd("start mspaint")
-    elif "command prompt" in command or "cmd" in command:
-        await run_via_cmd("start cmd")
+tts = TTS()
+
+def dispatch_intent(result_json):
+    """
+    Execute commands based on Gemini response.
+    """
+    intent = result_json.get("intent")
+    params = result_json.get("parameters", {})
+    speak_text = result_json.get("response_text", "")
+
+    if speak_text:
+        speak(speak_text)
+
+    if intent == "open_app":
+        app = params.get("app_name")
+        if app:
+            subprocess.run(app)
+    elif intent == "search_web":
+        query = params.get("query")
+        if query:
+            webbrowser.open(f"https://www.google.com/search?q={query}")
     else:
-        print("[intent] No matching app command.")
-
-async def run_via_cmd(cmd: str):
-    print(f"[cmd] Running: {cmd}")
-    subprocess.Popen(["cmd", "/c", cmd], shell=True)
+        speak("Sorry, I don't know how to do that yet.")
