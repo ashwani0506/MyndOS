@@ -1,97 +1,109 @@
-import asyncio
 import sounddevice as sd
 import numpy as np
-import io
-import wave
+import json
+import queue
+import sys
 
+from vosk import Model, KaldiRecognizer
+from rolling_buffer import RollingBuffer
 from transcriber import Transcriber
-from commands import dispatch_intent
-from wakeword import WakeWordDetector
-from llm_client import call_gemini
 from tts import TTS
+from commands import execute_command
 
-# Initialize components
-transcriber = Transcriber(model_size="base.en", compute_type="float16", device="cuda")
-wakeword_detector = WakeWordDetector(wake_words=["jarvis", "computer", "assistant"])
 tts = TTS()
 
-# --------- FIX: record_audio now safe for asyncio -----------
+# Config
+DEVICE = None                  # Default input device
+SAMPLERATE = 16000
+CHANNELS = 1
+BLOCKSIZE = 8000               # 0.5 seconds per chunk
+ROLLING_DURATION_SEC = 10      # store last N seconds of audio
+EXTRA_RECORD_SEC = 3           # extra time after wakeword
 
-def record_audio_sync(duration=5, sample_rate=16000):
-    print(f"[recorder] Recording (sync) for {duration} seconds...")
-    recording = sd.rec(int(duration * sample_rate),
-                       samplerate=sample_rate,
-                       channels=1,
-                       dtype='int16')
-    sd.wait()
-    print("[recorder] Finished recording.")
+WAKE_WORD = "jarvis"
 
-    # Convert numpy array to WAV bytes buffer
-    audio_flat = recording.flatten()
-    buffer = io.BytesIO()
-    with wave.open(buffer, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit PCM = 2 bytes
-        wf.setframerate(sample_rate)
-        wf.writeframes(audio_flat.tobytes())
-    buffer.seek(0)
-    return buffer
 
-async def record_audio(duration=5, sample_rate=16000):
-    """
-    Runs the blocking record_audio_sync() in a separate thread
-    so it doesn't freeze the asyncio event loop.
-    """
-    loop = asyncio.get_running_loop()
-    buffer = await loop.run_in_executor(None, record_audio_sync, duration, sample_rate)
-    return buffer
+def main():
+    print("[main] Loading Vosk model...")
+    model = Model(lang="en-us")
+    rec = KaldiRecognizer(model, SAMPLERATE)
 
-async def listen_for_command():
-    audio_buffer = await record_audio()
-    transcript = await transcriber.transcribe(audio_buffer)
-    return transcript
+    buffer = RollingBuffer(max_duration=ROLLING_DURATION_SEC, samplerate=SAMPLERATE)
+    transcriber = Transcriber()
 
-async def main_loop():
-    print("[main] Inside main_loop...")
+    q_in = queue.Queue()
 
-    try:
+    def callback(indata, frames, time, status):
+        if status:
+            print(status, file=sys.stderr)
+        # Convert to mono int16 bytes
+        data = indata.copy().flatten()
+        data_bytes = (data * 32767).astype(np.int16).tobytes()
+
+        buffer.add_chunk(data_bytes)
+        q_in.put(data_bytes)
+
+    print("[main] Starting audio stream...")
+    with sd.InputStream(device=DEVICE,
+                        channels=CHANNELS,
+                        samplerate=SAMPLERATE,
+                        blocksize=BLOCKSIZE,
+                        dtype='float32',
+                        callback=callback):
+
         while True:
-            # Start the wake word detector stream
-            wakeword_detector.start_stream()
-            print("[wakeword] Listening for wake word...")
+            data_bytes = q_in.get()
 
-            # Wait asynchronously for wake word detection
-            while not wakeword_detector.detect():
-                await asyncio.sleep(0.1)
+            if rec.AcceptWaveform(data_bytes):
+                result_json = json.loads(rec.Result())
+                text = result_json.get("text", "").lower()
+                if WAKE_WORD in text:
+                    print(f"[wakeword] Detected wake word: {WAKE_WORD}")
+                    tts.speak("Yes, sir")
 
-            print("[wakeword] Wake word detected.")
+                    # Capture additional audio after wake word
+                    additional_audio = capture_extra_audio(EXTRA_RECORD_SEC)
 
-            # Stop the wake word stream while we handle the command
-            wakeword_detector.stop_stream()
+                    # Combine rolling buffer + new audio
+                    audio_to_transcribe = buffer.get_audio() + additional_audio
 
-            # Speak response
-            await tts.speak_async("Yes Sir")
+                    # Transcribe
+                    transcription = run_transcription(transcriber, audio_to_transcribe)
+                    print(f"[main] User said: {transcription}")
 
-            # Record + transcribe user command
-            user_text = await listen_for_command()
-            print(f"[transcription] User said: {user_text}")
+                    if transcription.strip():
+                        tts.speak(f"You said: {transcription}")
+                        execute_command(transcription)
+                    else:
+                        tts.speak("I didn't catch that.")
 
-            if user_text:
-                # Call Gemini
-                result_json = call_gemini(user_text)
-                print(f"[llm] Gemini result: {result_json}")
+                    # Clear rolling buffer
+                    buffer.clear()
 
-                # Dispatch intent
-                await dispatch_intent(result_json)
 
-            # Go back to listening
-            print("[wakeword] Ready for next wake word...")
+def capture_extra_audio(duration_sec):
+    """Record a few extra seconds after wake word is detected."""
+    print(f"[main] Capturing additional {duration_sec} seconds of audio...")
+    frames = int(duration_sec * SAMPLERATE)
+    audio = sd.rec(frames, samplerate=SAMPLERATE, channels=CHANNELS, dtype='float32')
+    sd.wait()
+    data = audio.flatten()
+    data_bytes = (data * 32767).astype(np.int16).tobytes()
+    return data_bytes
 
-    except KeyboardInterrupt:
-        print("\n[main] Keyboard interrupt. Exiting...")
-    finally:
-        wakeword_detector.stop_stream()
+
+def run_transcription(transcriber, audio_bytes):
+    """
+    Helper to run asynchronous transcription synchronously for main.py context.
+    """
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = loop.run_until_complete(transcriber.transcribe_bytes(audio_bytes))
+    loop.close()
+    return result
+
 
 if __name__ == "__main__":
-    print("[main] Starting assistant...")
-    asyncio.run(main_loop())
+    main()

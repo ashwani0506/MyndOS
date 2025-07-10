@@ -2,12 +2,10 @@ from faster_whisper import WhisperModel
 import numpy as np
 
 class Transcriber:
-    def __init__(
-        self,
-        model_size="base.en",
-        compute_type="float16",
-        device="cuda"
-    ):
+    def __init__(self,
+                 model_size="base.en",
+                 compute_type="float16",
+                 device="cuda"):
         print("[transcriber] Loading Whisper model...")
         self.model = WhisperModel(
             model_size,
@@ -15,15 +13,18 @@ class Transcriber:
             device=device
         )
 
-    async def transcribe(self, audio_data, language="en", beam_size=1):
+    async def transcribe(self,
+                         audio_data: np.ndarray,
+                         language="en",
+                         beam_size=1) -> str:
         """
-        Transcribes audio data using Faster-Whisper.
-        
+        Transcribes raw PCM audio samples (int16) using Faster-Whisper.
+
         Args:
             audio_data (np.ndarray): Raw PCM audio samples (int16).
-            language (str): Language code (e.g. "en").
+            language (str): Language code.
             beam_size (int): Beam size for decoding.
-        
+
         Returns:
             str: Transcribed text.
         """
@@ -31,17 +32,41 @@ class Transcriber:
             print("[transcriber] Empty audio received.")
             return ""
 
-        # Convert int16 PCM to float32 [-1, 1]
+        # Convert int16 PCM to float32 in range [-1, 1]
         audio_float32 = audio_data.astype(np.float32) / 32768.0
 
-        # Transcribe entire chunk
         segments, info = self.model.transcribe(
             audio_float32,
             language=language,
             beam_size=beam_size
         )
 
-        transcript = " ".join([seg.text.strip() for seg in segments if seg.text.strip()])
+        transcript = " ".join(
+            seg.text.strip() for seg in segments if seg.text.strip()
+        )
         
         print(f"[transcriber] Transcript: {transcript}")
         return transcript
+
+    async def transcribe_bytes(self,
+                               audio_bytes: bytes,
+                               language="en",
+                               beam_size=1) -> str:
+        """
+        Converts raw bytes to numpy array and transcribes them.
+
+        Args:
+            audio_bytes (bytes): Raw PCM audio bytes.
+            language (str): Language code.
+            beam_size (int): Beam size for decoding.
+
+        Returns:
+            str: Transcribed text.
+        """
+        if audio_bytes is None or len(audio_bytes) == 0:
+            print("[transcriber] Empty audio bytes received.")
+            return ""
+
+        # Convert bytes → numpy array of int16
+        audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+        return await self.transcribe(audio_array, language=language, beam_size=beam_size)

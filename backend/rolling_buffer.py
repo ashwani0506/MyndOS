@@ -1,18 +1,22 @@
-import numpy as np
-from collections import deque
+
+import collections
 
 class RollingBuffer:
-    def __init__(self, max_duration=8, sample_rate=16000):
-        self.sample_rate = sample_rate
-        self.max_samples = max_duration * sample_rate
-        self.buffer = deque()
+    def __init__(self, max_duration, samplerate):
+        self.max_bytes = int(max_duration * samplerate * 2) # 16-bit PCM
+        self.buffer = collections.deque()
+        self.size = 0
 
-    def extend(self, data):
-        self.buffer.extend(data)
-        while len(self.buffer) > self.max_samples:
-            self.buffer.popleft()
+    def add_chunk(self, chunk):
+        self.buffer.append(chunk)
+        self.size += len(chunk)
+        while self.size > self.max_bytes:
+            old = self.buffer.popleft()
+            self.size -= len(old)
 
     def get_audio(self):
-        if len(self.buffer) == 0:
-            return None
-        return np.array(self.buffer, dtype=np.int16)
+        return b''.join(self.buffer)
+
+    def clear(self):
+        self.buffer.clear()
+        self.size = 0
