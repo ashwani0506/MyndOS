@@ -33,6 +33,9 @@ def main():
 
     q_in = queue.Queue()
 
+    # Define a stream variable outside so we can start/stop it
+    stream = None
+
     def callback(indata, frames, time, status):
         if status:
             print(status, file=sys.stderr)
@@ -43,14 +46,31 @@ def main():
         buffer.add_chunk(data_bytes)
         q_in.put(data_bytes)
 
-    print("[main] Starting audio stream...")
-    with sd.InputStream(device=DEVICE,
-                        channels=CHANNELS,
-                        samplerate=SAMPLERATE,
-                        blocksize=BLOCKSIZE,
-                        dtype='float32',
-                        callback=callback):
+    def start_stream():
+        nonlocal stream
+        stream = sd.InputStream(
+            device=DEVICE,
+            channels=CHANNELS,
+            samplerate=SAMPLERATE,
+            blocksize=BLOCKSIZE,
+            dtype='float32',
+            callback=callback
+        )
+        stream.start()
+        print("[main] Microphone stream started.")
 
+    def stop_stream():
+        nonlocal stream
+        if stream:
+            stream.stop()
+            stream.close()
+            stream = None
+            print("[main] Microphone stream stopped.")
+
+    # Start the mic initially
+    start_stream()
+
+    try:
         while True:
             data_bytes = q_in.get()
 
@@ -59,9 +79,13 @@ def main():
                 text = result_json.get("text", "").lower()
                 if WAKE_WORD in text:
                     print(f"[wakeword] Detected wake word: {WAKE_WORD}")
+
+                    # Stop mic so TTS doesn't leak into audio
+                    stop_stream()
+
                     tts.speak("Yes, sir")
 
-                    # Capture additional audio after wake word
+                    # Capture extra audio after wake word
                     additional_audio = capture_extra_audio(EXTRA_RECORD_SEC)
 
                     # Combine rolling buffer + new audio
@@ -79,6 +103,14 @@ def main():
 
                     # Clear rolling buffer
                     buffer.clear()
+
+                    # Restart mic after all TTS is done
+                    start_stream()
+
+    except KeyboardInterrupt:
+        print("[main] Exiting.")
+    finally:
+        stop_stream()
 
 
 def capture_extra_audio(duration_sec):
