@@ -44,3 +44,7 @@ desktop.ini
 backend/models/
 
 .env
+# Local-only project brief and secrets
+CLAUDE.md
+backend/.env
+backend/logs/

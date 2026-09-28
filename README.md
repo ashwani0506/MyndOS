@@ -1,377 +1,155 @@
-# MyndOS 🧠
+# MyndOS
 
-**MyndOS** is a voice-first, AI-powered desktop assistant designed to interact with your computer at the operating-system level.
+A voice-first desktop assistant that runs locally on Windows, starts at login,
+and is built so that **the model can propose an action but never executes it directly** —
+a separate execution layer decides what's permitted.
 
-Unlike traditional AI assistants that are limited to answering questions or controlling web applications, MyndOS is designed to **understand natural-language commands, plan the required actions, interact with native desktop applications, and execute tasks through a controlled system layer**.
-
-The goal is simple:
-
-> **Turn natural language into safe, actionable computer operations.**
-
----
-
-## ✨ Features
-
-* 🎙️ **Voice-first interaction**
-
-  * Communicate with MyndOS using natural language.
-  * Convert spoken commands into actionable instructions.
-
-* 🤖 **AI-powered task planning**
-
-  * Understands multi-step requests.
-  * Breaks complex commands into individual actions.
-
-* 🖥️ **Native desktop interaction**
-
-  * Designed to interact with system applications instead of relying solely on browser automation.
-  * Can perform OS-level actions through dedicated execution tools.
-
-* 🛡️ **Safety & Guardrails**
-
-  * AI-generated actions are passed through a trusted execution layer before being performed.
-  * Sensitive operations can require explicit user confirmation.
-  * Destructive operations can be restricted through predefined rules.
-
-* 📋 **Action Logging**
-
-  * Records executed actions for transparency and debugging.
-  * Makes it easier to understand what the assistant actually did.
-
-* 🧩 **Skill-based architecture**
-
-  * Capabilities can be organized into individual skills/tools.
-  * New functionality can be added without redesigning the entire system.
+Single-user by design. This is my daily driver and my portfolio piece, so the
+status table below is honest about what is built and what isn't.
 
 ---
 
-## 🏗️ Architecture
+## Status
 
-MyndOS follows a layered architecture:
+| Component | State |
+|---|---|
+| Wake word → STT → TTS loop | **Working.** Vosk wake word, faster-whisper transcription, pyttsx3 speech. |
+| Model router (`brain.py`) | **Working.** Tiered, multi-provider, cooldown-aware fallback. |
+| Persona + user profile | **Working.** Plain markdown, re-read per request. |
+| Text REPL (`agent.py`) | **Working.** |
+| Command dispatch | **Placeholder.** Two hardcoded keywords. Replaced by the planner + execution layer next. |
+| Trusted execution layer | Not built — next up. |
+| Action log | Partial: LLM calls are logged, tool calls don't exist yet. |
+| Long-term memory | Not built. |
+| Intent router / VAD / local TTS | Not built — voice loop is a rebuild, see Roadmap. |
+| Tauri UI | Empty shell, parked until there's a memory/log inspector to put in it. |
 
-```text
-                    ┌─────────────────────┐
-                    │       User          │
-                    │  Voice / Text Input │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │   Speech / Input    │
-                    │     Processing      │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │     AI Planner      │
-                    │                     │
-                    │ Understands intent  │
-                    │ & creates task plan │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │ Trusted Execution   │
-                    │       Layer         │
-                    │                     │
-                    │ • Validate actions  │
-                    │ • Apply guardrails  │
-                    │ • Request approval │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-              ┌─────────────────────────────────┐
-              │        System Control           │
-              │                                 │
-              │  OS APIs / Desktop Automation  │
-              │  Applications / Files / System │
-              └────────────────┬────────────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │    Action Logger    │
-                    └─────────────────────┘
+---
+
+## The model layer
+
+The constraint that shaped this: **it has to work all day on a student budget,
+including offline, without a paid API.**
+
+`brain.py` is ~120 lines and routes across providers that are all
+OpenAI-compatible, so one client shape covers every one of them — only
+`base_url`, key and model name change. No gateway, no second daemon that has to
+be alive before a login-start assistant can work.
+
+Two tiers, each an ordered chain:
+
+```
+fast  →  ollama (local) → groq → gemini
+deep  →  claude → groq → gemini → openrouter → ollama (local)
 ```
 
-### Why the execution layer matters
+- **`fast` starts local.** No network round trip, no quota, no failure mode.
+  Intent classification and reflexive answers never leave the machine.
+- **`deep` ends local.** When every free quota is exhausted the assistant
+  degrades instead of going dark.
+- **Failures cool down, they don't retry.** A provider that returns 429 or fails
+  auth is skipped for 10 minutes. This is what makes an intermittently-available
+  key usable: one wasted request every 10 minutes instead of one per command.
 
-The AI should **not have unrestricted control over the operating system**.
+Every provider uses my own key on its own published free tier. No credential
+pooling, no free-tier aggregation across throwaway accounts, no TLS
+interception — all of which are the reason I did not adopt an off-the-shelf
+routing gateway for this.
 
-Instead, MyndOS separates:
-
-1. **What the AI wants to do**
-2. **What the system allows it to do**
-3. **What actually gets executed**
-
-This provides an additional security boundary between AI-generated instructions and real system operations.
-
----
-
-## 🔄 How It Works
-
-A typical request follows this pipeline:
-
-```text
-User Command
-     │
-     ▼
-Understand Intent
-     │
-     ▼
-Generate Task Plan
-     │
-     ▼
-Validate Plan
-     │
-     ├──── Unsafe ────► Reject
-     │
-     ▼
-Requires Confirmation?
-     │
-     ├──── Yes ───────► Ask User
-     │
-     ▼
-Execute Actions
-     │
-     ▼
-Log Result
-     │
-     ▼
-Return Response
-```
-
-For example:
-
-```text
-"Open my text editor and create a new file"
-```
-
-can be interpreted as:
-
-```text
-1. Identify the requested application
-2. Launch the application
-3. Wait for the application to become available
-4. Create a new document
-5. Report completion
-```
-
-Each operation can be validated before execution.
+Adding a provider is one entry in `PROVIDERS` and one line in `CHAINS`.
 
 ---
 
-## 🛡️ Security Model
+## Security model
 
-System-level AI automation introduces an important problem:
+The assistant runs as a normal user account and never requests elevation.
+Capabilities are tiered rather than granted wholesale:
 
-**An AI should not automatically be trusted with every operation it can technically perform.**
+| Tier | Examples | Handling |
+|---|---|---|
+| Always-on | Clipboard/selection read, scoped project file read | Execute |
+| Explicit invocation | Screen capture, audio beyond wake-word detection | Only on a direct command, never continuous |
+| Always confirmed | Send a message, submit a form, delete/overwrite, spend money, install software, write outside a scoped folder | Confirmation every time, no exceptions |
 
-MyndOS addresses this through predefined rules and execution boundaries.
+Two rules that constrain the whole design:
 
-Actions can be classified according to their risk:
+1. **Anything the agent reads is data, not instructions.** Web pages, files and
+   screen contents cannot trigger a consequential tool call — only I can.
+2. **Every tool call is logged** to human-readable JSONL: what was called, with
+   what input, what came back.
 
-| Action      | Example                  | Handling                        |
-| ----------- | ------------------------ | ------------------------------- |
-| Safe        | Open an application      | Execute                         |
-| Safe        | Read information         | Execute                         |
-| Moderate    | Modify application state | Validate                        |
-| Sensitive   | Send an external message | Confirmation                    |
-| Destructive | Delete important data    | Block / Require strict approval |
-
-The exact rules can be extended as new capabilities are added.
-
----
-
-## 🧰 Technology
-
-The project is designed around a combination of AI orchestration, desktop automation, and system-level execution.
-
-### Core Components
-
-* **Python** — AI/backend logic
-* **LangGraph** — Agent/task orchestration
-* **Tauri + JavaScript** — Desktop application interface
-* **OS APIs / subprocess** — System-level operations
-* **PyAutoGUI / PyWinAuto** — Desktop application interaction
-* **Speech-to-Text / TTS** — Voice interaction
-* **JSON/YAML** — Skills, permissions, and execution rules
-
-> The exact technologies may evolve as the project develops.
+The tiering and the confirmation gate are specified but **not yet implemented** —
+that is the next piece of work, and it lands before any consequential tool does.
 
 ---
 
-## 📁 Project Structure
+## Setup
 
-A possible high-level structure is:
-
-```text
-MyndOS/
-│
-├── frontend/
-│   └── ...
-│
-├── backend/
-│   ├── agent/
-│   ├── execution/
-│   ├── skills/
-│   ├── rules/
-│   └── logging/
-│
-├── config/
-│   └── ...
-│
-├── tests/
-│
-├── requirements.txt
-├── README.md
-└── ...
-```
-
-The architecture intentionally keeps **AI reasoning** separate from **system execution** so that the execution layer can independently enforce safety policies.
-
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-
-Make sure the following are installed:
-
-* Python 3.x
-* Node.js
-* Rust
-* Tauri prerequisites for your operating system
-
-### Clone the Repository
+Requires Python 3.12+. Optional but recommended: [Ollama](https://ollama.com)
+for the local tier.
 
 ```bash
-git clone <your-repository-url>
-cd MyndOS
+pip install -r backend/requirements.txt
+cp backend/.env.example backend/.env    # fill in whichever keys you have
 ```
 
-### Install Backend Dependencies
+All keys are optional — the router uses what's present and skips the rest.
+For the local floor:
 
 ```bash
-pip install -r requirements.txt
+ollama pull qwen3:4b
 ```
 
-### Install Frontend Dependencies
+Text mode:
 
 ```bash
-npm install
+python backend/agent.py
 ```
 
-### Start the Application
+`/status` shows which providers are configured and live. `/fast <message>`
+forces the cheap tier.
 
-Use the development command configured for the project:
+Voice mode (wake word "Jarvis"):
 
 ```bash
-npm run tauri dev
+python backend/main.py
 ```
 
-> Update these commands if the current repository uses a different startup process.
+On a 4GB GPU, keep the LLM on CUDA and let Whisper run on CPU — `base.en` in
+int8 transcribes a short command in well under a second and leaves the VRAM free.
 
 ---
 
-## 💡 Example Commands
+## Roadmap
 
-MyndOS is intended to understand commands such as:
+1. **Trusted execution layer** — tool registry with a risk tier per tool, the
+   confirmation gate, JSONL action log. Before any real tool ships.
+2. **Memory** — SQLite FTS5 over markdown notes. Hand-editable and inspectable;
+   embeddings only if keyword recall demonstrably falls short.
+3. **First real tools** — clipboard read, then scoped file read/write.
+4. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
+   ASR continuously. Replacing with openWakeWord (near-zero idle compute) →
+   VAD-terminated capture instead of a fixed 3s window → Piper for local TTS.
+5. Remaining skills one at a time; persona tuning last.
 
-```text
-"Open Notepad."
+---
 
-"Open the calculator."
-
-"Create a new text document."
-
-"Open my project folder."
-
-"Launch the application I need."
+## Layout
 
 ```
-
-More complex workflows can be represented as a sequence of validated actions.
-
----
-
-## 🔐 Design Philosophy
-
-MyndOS is built around three principles:
-
-### 1. Natural Interaction
-
-Users should be able to describe **what they want**, rather than manually specifying every computer operation.
-
-### 2. AI-Assisted Execution
-
-The AI handles intent understanding and task planning while specialized tools perform the actual operations.
-
-### 3. Controlled Autonomy
-
-Giving an AI access to the operating system without restrictions is dangerous.
-
-MyndOS therefore treats **execution permissions as a separate concern from AI reasoning**.
-
-The AI can propose an action, but the execution layer determines whether that action is permitted.
-
----
-
-## 🔮 Future Improvements
-
-Potential areas for expansion include:
-
-* More native application integrations
-* Improved voice recognition
-* Persistent user preferences
-* More sophisticated task planning
-* Plugin/skill system
-* Better permission management
-* Visual feedback for executing tasks
-* Improved error recovery
-* More granular confirmation policies
-* Cross-platform support
-* Advanced workflow automation
-
----
-
-## 🎯 Vision
-
-The long-term goal of MyndOS is to move beyond the traditional chatbot interface.
-
-Instead of asking an AI:
-
-> "How do I perform this task?"
-
-you should be able to say:
-
-> **"Do it for me."**
-
-MyndOS aims to make that possible while maintaining a clear boundary between **AI decision-making and actual system control**.
-
----
-
-## 👨‍💻 Project
-
-**MyndOS**
-An AI-powered, voice-first operating-system assistant.
-
-Built to explore the intersection of:
-
-* Artificial Intelligence
-* Agentic Systems
-* Desktop Automation
-* Human-Computer Interaction
-* System Security
-* Voice Interfaces
-
----
-
-## 📄 License
-
-Add your preferred license here.
-
-For example:
-
-```text
-MIT License
+backend/
+  brain.py        model router — tiers, fallback chain, cooldown
+  agent.py        conversation loop + text REPL
+  persona.md      voice and behaviour (edit freely)
+  profile.md      who I am, current projects (edit freely)
+  main.py         voice loop: wake word → STT → dispatch
+  transcriber.py  faster-whisper wrapper
+  tts.py          shared pyttsx3 engine
+  rolling_buffer.py
+  commands.py     placeholder dispatch, being replaced
+frontend/MyndOS/  Tauri shell, parked
 ```
+
+## License
+
+MIT
