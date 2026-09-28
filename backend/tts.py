@@ -30,3 +30,8 @@ class TTS:
         """
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self.speak, text)
+
+
+# Shared engine. pyttsx3/SAPI5 deadlocks if two engines run concurrently,
+# so every module speaks through this one.
+tts = TTS()

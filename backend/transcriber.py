@@ -4,8 +4,8 @@ import numpy as np
 class Transcriber:
     def __init__(self,
                  model_size="base.en",
-                 compute_type="float16",
-                 device="cuda"):
+                 compute_type="auto",
+                 device="auto"):  # cuda when available, else cpu — don't hard-crash on a machine without it
         print("[transcriber] Loading Whisper model...")
         self.model = WhisperModel(
             model_size,

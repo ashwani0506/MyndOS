@@ -7,10 +7,8 @@ import sys
 from vosk import Model, KaldiRecognizer
 from rolling_buffer import RollingBuffer
 from transcriber import Transcriber
-from tts import TTS
+from tts import tts
 from commands import execute_command
-
-tts = TTS()
 
 # Config
 DEVICE = None                  # Default input device
