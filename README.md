@@ -15,14 +15,13 @@ status table below is honest about what is built and what isn't.
 |---|---|
 | Wake word → STT → TTS loop | **Working.** Vosk wake word, faster-whisper transcription, pyttsx3 speech. |
 | Model router (`brain.py`) | **Working.** Tiered, multi-provider, cooldown-aware fallback. |
+| Trusted execution layer (`tools.py`) | **Working.** Risk-tiered registry, confirmation gate, action log. |
+| Tools | Clipboard read, scoped file read, confirmed file write. |
 | Persona + user profile | **Working.** Plain markdown, re-read per request. |
-| Text REPL (`agent.py`) | **Working.** |
-| Command dispatch | **Placeholder.** Two hardcoded keywords. Replaced by the planner + execution layer next. |
-| Trusted execution layer | Not built — next up. |
-| Action log | Partial: LLM calls are logged, tool calls don't exist yet. |
+| Text REPL (`agent.py`) | **Working.** Full tool-calling loop. |
+| Command dispatch (voice) | **Placeholder.** Two hardcoded keywords; still on the old path, not yet routed through the execution layer. |
 | Long-term memory | Not built. |
 | Intent router / VAD / local TTS | Not built — voice loop is a rebuild, see Roadmap. |
-| Tauri UI | Empty shell, parked until there's a memory/log inspector to put in it. |
 
 ---
 
@@ -48,8 +47,16 @@ deep  →  claude → groq → gemini → openrouter → ollama (local)
 - **`deep` ends local.** When every free quota is exhausted the assistant
   degrades instead of going dark.
 - **Failures cool down, they don't retry.** A provider that returns 429 or fails
-  auth is skipped for 10 minutes. This is what makes an intermittently-available
-  key usable: one wasted request every 10 minutes instead of one per command.
+  auth is skipped for 10 minutes, so one wasted request replaces one per command.
+- **Known-dead hours are skipped on the clock.** A provider can declare a
+  `window` — the local-time range its key actually serves. Outside it the
+  provider is never tried at all. The two mechanisms compose: the window covers
+  hours that are reliably dead, the cooldown covers a key draining early inside
+  its window.
+
+The window is what makes a part-time key worth having in first position. A
+reseller key that only serves 16:30–18:30 gives me Sonnet during those two hours
+and costs exactly nothing — not even one failed request — for the other 22.
 
 Every provider uses my own key on its own published free tier. No credential
 pooling, no free-tier aggregation across throwaway accounts, no TLS
@@ -63,23 +70,28 @@ Adding a provider is one entry in `PROVIDERS` and one line in `CHAINS`.
 ## Security model
 
 The assistant runs as a normal user account and never requests elevation.
-Capabilities are tiered rather than granted wholesale:
+Capabilities are tiered rather than granted wholesale — `tools.py` enforces
+this, and no tool reaches the model except through it:
 
 | Tier | Examples | Handling |
 |---|---|---|
-| Always-on | Clipboard/selection read, scoped project file read | Execute |
-| Explicit invocation | Screen capture, audio beyond wake-word detection | Only on a direct command, never continuous |
-| Always confirmed | Send a message, submit a form, delete/overwrite, spend money, install software, write outside a scoped folder | Confirmation every time, no exceptions |
+| `SAFE` | Clipboard read, scoped project file read | Execute |
+| `EXPLICIT` | Screen capture, audio beyond wake-word detection | Only on a direct command from me. A model-initiated call is refused, so nothing the agent *read* can switch these on. |
+| `CONFIRM` | Send a message, submit a form, delete/overwrite, spend money, install software, write outside a scoped folder | Prompt every time. No "remember this choice", and `user_initiated` does not substitute for consent. |
 
 Two rules that constrain the whole design:
 
-1. **Anything the agent reads is data, not instructions.** Web pages, files and
-   screen contents cannot trigger a consequential tool call — only I can.
-2. **Every tool call is logged** to human-readable JSONL: what was called, with
-   what input, what came back.
+1. **Anything the agent reads is data, not instructions.** Tool calls the model
+   produces carry `user_initiated=False` — the flag is set at the call site in
+   `agent.py`, not by the model — so a web page or file cannot reach an
+   `EXPLICIT` tool, and a `CONFIRM` tool still stops for a human.
+2. **Every tool call is logged** to `backend/logs/actions.jsonl`: name,
+   arguments, outcome. Refusals and denials are logged too — those are the
+   interesting ones.
 
-The tiering and the confirmation gate are specified but **not yet implemented** —
-that is the next piece of work, and it lands before any consequential tool does.
+Scoped paths are resolved before the check, so `../` cannot walk out of scope.
+`python backend/test_tools.py` exercises the gate: every tier, traversal, and
+the log.
 
 ---
 
@@ -90,7 +102,7 @@ for the local tier.
 
 ```bash
 pip install -r backend/requirements.txt
-cp backend/.env.example backend/.env    # fill in whichever keys you have
+cp .env.example .env    # fill in whichever keys you have
 ```
 
 All keys are optional — the router uses what's present and skips the rest.
@@ -106,8 +118,8 @@ Text mode:
 python backend/agent.py
 ```
 
-`/status` shows which providers are configured and live. `/fast <message>`
-forces the cheap tier.
+`/status` shows which providers are configured and live. `/tools` lists the
+registry with each tool's risk tier. `/fast <message>` forces the cheap tier.
 
 Voice mode (wake word "Jarvis"):
 
@@ -122,15 +134,16 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
 
 ## Roadmap
 
-1. **Trusted execution layer** — tool registry with a risk tier per tool, the
-   confirmation gate, JSONL action log. Before any real tool ships.
-2. **Memory** — SQLite FTS5 over markdown notes. Hand-editable and inspectable;
+1. **Memory** — SQLite FTS5 over markdown notes. Hand-editable and inspectable;
    embeddings only if keyword recall demonstrably falls short.
-3. **First real tools** — clipboard read, then scoped file read/write.
+2. **Route voice through the execution layer** — `commands.py` still dispatches
+   on two hardcoded keywords and bypasses the gate entirely. It goes next.
+3. **More tools** — calendar read, scoped screen capture (`EXPLICIT`), web
+   search (read-only).
 4. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
    ASR continuously. Replacing with openWakeWord (near-zero idle compute) →
    VAD-terminated capture instead of a fixed 3s window → Piper for local TTS.
-5. Remaining skills one at a time; persona tuning last.
+5. Persona tuning last.
 
 ---
 
@@ -138,7 +151,8 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
 
 ```
 backend/
-  brain.py        model router — tiers, fallback chain, cooldown
+  brain.py        model router — tiers, fallback chain, cooldown, service windows
+  tools.py        execution layer — risk tiers, confirmation gate, action log
   agent.py        conversation loop + text REPL
   persona.md      voice and behaviour (edit freely)
   profile.md      who I am, current projects (edit freely)
@@ -147,7 +161,9 @@ backend/
   tts.py          shared pyttsx3 engine
   rolling_buffer.py
   commands.py     placeholder dispatch, being replaced
-frontend/MyndOS/  Tauri shell, parked
+  test_brain.py   router self-check (no network, no keys needed)
+  test_tools.py   gate self-check (no network, no real writes)
+  logs/           brain.jsonl, actions.jsonl — gitignored
 ```
 
 ## License

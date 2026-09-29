@@ -1,15 +1,18 @@
-"""The conversation loop: persona + profile + history -> brain -> reply.
+"""The conversation loop: persona + profile + history -> brain -> tools -> reply.
 
 Kept separate from the CLI below it because the voice pipeline will drive the
 same Agent object later. Run `python agent.py` for a text REPL.
 """
 
+import json
 from pathlib import Path
 
 import brain
+import tools
 
 HERE = Path(__file__).parent
 MAX_TURNS = 20  # ponytail: flat truncation, replace when the memory layer lands
+MAX_HOPS = 5    # tool rounds per message, so a confused model can't loop forever
 
 
 def system_prompt() -> str:
@@ -25,16 +28,42 @@ class Agent:
 
     def say(self, text: str, tier: str = "deep") -> str:
         self.history.append({"role": "user", "content": text})
-        transcript = "\n".join(f"{m['role']}: {m['content']}" for m in self.history[-MAX_TURNS:])
-        reply = brain.think(transcript, tier=tier, system=system_prompt())
-        self.history.append({"role": "assistant", "content": reply})
-        return reply
+
+        for _ in range(MAX_HOPS):
+            messages = [{"role": "system", "content": system_prompt()}]
+            # Truncation can cut between an assistant tool_calls message and its
+            # replies; a leading orphan "tool" message is a 400 from every API.
+            window = self.history[-MAX_TURNS:]
+            while window and window[0]["role"] == "tool":
+                window.pop(0)
+            messages += window
+            msg = brain.complete(messages, tier=tier, tools=tools.schemas()).choices[0].message
+            turn = msg.model_dump(exclude_none=True)
+            turn.setdefault("content", None)  # some endpoints require the key present
+            self.history.append(turn)
+
+            if not msg.tool_calls:
+                return msg.content or ""
+
+            for call in msg.tool_calls:
+                # user_initiated stays False: these came from the model, which
+                # may have been reasoning over something it read. The gate
+                # refuses EXPLICIT tools here by design -- I have to invoke
+                # those myself.
+                result = tools.execute(
+                    call.function.name, json.loads(call.function.arguments or "{}")
+                )
+                self.history.append(
+                    {"role": "tool", "tool_call_id": call.id, "content": result}
+                )
+
+        return "I got stuck in a tool loop and stopped. Ask me again, more specifically."
 
 
 def main():
     agent = Agent()
-    print("MyndOS (text mode). '/status' for providers, '/fast <msg>' for the "
-          "cheap tier, Ctrl-C to quit.\n")
+    print("MyndOS (text mode). '/status' for providers, '/tools' for the "
+          "registry, '/fast <msg>' for the cheap tier, Ctrl-C to quit.\n")
     print(brain.status(), "\n")
 
     while True:
@@ -48,6 +77,11 @@ def main():
             continue
         if text == "/status":
             print(brain.status(), "\n")
+            continue
+        if text == "/tools":
+            for t in tools.REGISTRY.values():
+                print(f"  {t.name:<16} [{t.risk.value:<8}] {t.description}")
+            print()
             continue
 
         tier = "deep"
