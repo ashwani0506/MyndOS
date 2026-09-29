@@ -20,7 +20,7 @@ def _safe() -> str:
     return "did safe"
 
 
-@tools.tool(Risk.EXPLICIT, "test")
+@tools.tool(Risk.EXPLICIT, "test", unlock=("show me the magic",))
 def _explicit() -> str:
     ran.append("explicit")
     return "did explicit"
@@ -61,6 +61,47 @@ def test_confirm_asks_even_when_i_asked_for_it():
 
     assert execute("_confirm", confirm=yes) == "did confirm"
     assert ran == ["confirm"]
+
+
+def test_only_my_words_unlock_an_explicit_tool():
+    assert tools.unlocked_by("show me the magic please") == {"_explicit"}
+    assert tools.unlocked_by("what's the weather") == frozenset()
+    # Folded both ways: a transcript won't match my capitalisation, and a phrase
+    # declared with capitals still has to match a transcript.
+    assert "_explicit" in tools.unlocked_by("SHOW ME THE MAGIC")
+
+    @tools.tool(Risk.EXPLICIT, "test", unlock=("Loud Noises",))
+    def _shouty() -> str:
+        return "ok"
+
+    assert "_shouty" in tools.unlocked_by("make loud noises")
+
+
+def test_an_explicit_tool_with_no_unlock_words_is_rejected_at_registration():
+    """The hole this closes: such a tool sits in the registry looking available
+    and refuses every call, because nothing can ever authorise it."""
+    try:
+
+        @tools.tool(Risk.EXPLICIT, "unreachable")
+        def _no_words() -> str:
+            return "never"
+
+    except ValueError as e:
+        assert "unlock words" in str(e)
+    else:
+        raise AssertionError("an unreachable EXPLICIT tool was accepted")
+
+
+def test_unlocking_one_tool_does_not_unlock_another():
+    """The grant is per tool, not a blanket "he spoke" flag -- asking for a
+    screenshot must not also switch the microphone on."""
+
+    @tools.tool(Risk.EXPLICIT, "test", unlock=("record audio",))
+    def _mic() -> str:
+        return "recorded"
+
+    assert tools.unlocked_by("show me the magic") == {"_explicit"}
+    assert tools.unlocked_by("record audio now") == {"_mic"}
 
 
 def test_unknown_tool_does_not_raise():

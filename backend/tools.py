@@ -5,18 +5,20 @@ Three risk tiers:
 
   SAFE      Execute. Reading the clipboard, reading a file inside a scoped
             project folder.
-  EXPLICIT  Only on a direct command from me -- never model-initiated. Screen
-            and audio capture live here, so no plan the model writes can switch
-            them on by itself.
+  EXPLICIT  Only when my own words asked for it. Each tool declares the words
+            that unlock it, and the grant is computed from my utterance alone --
+            so screen and audio capture cannot be switched on by the model, or
+            by anything the model read.
   CONFIRM   Stop and ask, every single time. Sending anything, deleting or
             overwriting, spending money, installing, writing outside scope.
             There is deliberately no "remember this choice".
 
 Two invariants this file exists to hold:
 
-  1. Nothing the agent *read* can trigger a consequential call. Model-initiated
-     calls carry user_initiated=False, which can never reach an EXPLICIT tool;
-     CONFIRM tools still stop for a human regardless of who asked.
+  1. Nothing the agent *read* can trigger a consequential call. An EXPLICIT
+     tool is authorised only by words in my own utterance (see unlocked_by),
+     which is not a channel the model or a poisoned file can write to; CONFIRM
+     tools stop for a human regardless of who asked.
   2. Every call is logged -- name, arguments, outcome -- including refusals and
      denials, which are the interesting ones.
 
@@ -51,17 +53,55 @@ class Tool:
     risk: Risk
     params: dict
     fn: Callable
+    unlock: tuple[str, ...] = ()  # EXPLICIT only: phrases in my words that authorise it
 
 
 REGISTRY: dict[str, Tool] = {}
 
 
-def tool(risk: Risk, description: str, params: dict | None = None):
+def tool(
+    risk: Risk,
+    description: str,
+    params: dict | None = None,
+    unlock: tuple[str, ...] = (),
+):
     def register(fn):
-        REGISTRY[fn.__name__] = Tool(fn.__name__, description, risk, params or {}, fn)
+        # An EXPLICIT tool with no unlock words can never be authorised by
+        # anything, so it would sit in the registry looking available and refuse
+        # every call. Fail at import rather than at 3am.
+        if risk is Risk.EXPLICIT and not unlock:
+            raise ValueError(
+                f"{fn.__name__} is EXPLICIT but declares no unlock words, "
+                f"so nothing could ever authorise it"
+            )
+        REGISTRY[fn.__name__] = Tool(
+            # Folded here, once, so a phrase declared with capitals still
+            # matches a lower-cased transcript.
+            fn.__name__, description, risk, params or {}, fn,
+            tuple(w.lower() for w in unlock),
+        )
         return fn
 
     return register
+
+
+def unlocked_by(utterance: str) -> frozenset[str]:
+    """Names of the EXPLICIT tools this utterance authorises, for this turn only.
+
+    The grant is derived from what the human said and nothing else -- not the
+    model's reasoning, not a file it read, not a web page. That asymmetry is the
+    whole tier: injected text can ask for a screenshot all it likes, but it
+    cannot put the word in my mouth.
+
+    ponytail: crude substring match. Swap in the intent classifier when the
+    command router lands -- the call site doesn't change.
+    """
+    low = utterance.lower()
+    return frozenset(
+        t.name
+        for t in REGISTRY.values()
+        if t.risk is Risk.EXPLICIT and any(w in low for w in t.unlock)
+    )
 
 
 def in_scope(path: str | Path) -> bool:
@@ -96,8 +136,8 @@ def execute(
 ) -> str:
     """Run a registered tool through the gate. Returns a string for the model.
 
-    `user_initiated` must be True only for something I said directly -- never
-    for a call the model produced while reasoning over content it read.
+    `user_initiated` must come from unlocked_by() on my own utterance -- never
+    from the model asserting that a call was my idea.
     """
     args = args or {}
     entry = {"tool": name, "args": args, "user_initiated": user_initiated}

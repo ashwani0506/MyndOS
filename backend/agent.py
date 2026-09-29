@@ -33,6 +33,10 @@ class Agent:
 
     def say(self, text: str, tier: str = "deep") -> str:
         self.history.append({"role": "user", "content": text})
+        # Which EXPLICIT tools this turn is allowed to use, computed from the
+        # raw utterance before the model sees it. Recomputed every turn, so a
+        # grant never outlives the sentence that asked for it.
+        unlocked = tools.unlocked_by(text)
 
         for _ in range(MAX_HOPS):
             messages = [{"role": "system", "content": system_prompt()}]
@@ -62,12 +66,15 @@ class Agent:
                 except ValueError as e:  # JSONDecodeError included
                     result = f"Bad arguments for {call.function.name}: {e}"
                 else:
-                    # user_initiated stays False: these came from the model,
-                    # which may have been reasoning over something it read. The
-                    # gate refuses EXPLICIT tools here by design -- I have to
-                    # invoke those myself.
+                    # The EXPLICIT grant comes from `unlocked`, which was built
+                    # from his words alone -- never from the model asking for
+                    # it, and never from a file or page it read mid-turn.
+                    # CONFIRM tools still stop for a human either way.
                     result = tools.execute(
-                        call.function.name, args, confirm=self.confirm
+                        call.function.name,
+                        args,
+                        user_initiated=call.function.name in unlocked,
+                        confirm=self.confirm,
                     )
                 self.history.append(
                     {"role": "tool", "tool_call_id": call.id, "content": result}

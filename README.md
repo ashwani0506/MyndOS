@@ -76,15 +76,19 @@ this, and no tool reaches the model except through it:
 | Tier | Examples | Handling |
 |---|---|---|
 | `SAFE` | Clipboard read, scoped project file read | Execute |
-| `EXPLICIT` | Screen capture, audio beyond wake-word detection | Only on a direct command from me. A model-initiated call is refused, so nothing the agent *read* can switch these on. |
+| `EXPLICIT` | Screen capture, audio beyond wake-word detection | Only when my own words asked for it. Each tool declares the phrases that unlock it; the grant is per turn and per tool, so asking for a screenshot doesn't also switch the microphone on. |
 | `CONFIRM` | Send a message, submit a form, delete/overwrite, spend money, install software, write outside a scoped folder | Prompt every time. No "remember this choice", and `user_initiated` does not substitute for consent. |
 
 Two rules that constrain the whole design:
 
-1. **Anything the agent reads is data, not instructions.** Tool calls the model
-   produces carry `user_initiated=False` — the flag is set at the call site in
-   `agent.py`, not by the model — so a web page or file cannot reach an
-   `EXPLICIT` tool, and a `CONFIRM` tool still stops for a human.
+1. **Anything the agent reads is data, not instructions.** An `EXPLICIT` tool is
+   authorised only by words in my own utterance: `tools.unlocked_by()` computes
+   the grant from the raw transcript before the model sees it, and the model's
+   tool calls are checked against that set. A file or web page can ask for a
+   screenshot all it likes — it cannot put the word in my mouth, because read
+   content is not an input to the grant. `CONFIRM` tools stop for a human
+   regardless. Registering an `EXPLICIT` tool with no unlock phrases raises at
+   import, so the tier can't quietly contain something unreachable.
 2. **Every tool call is logged** to `backend/logs/actions.jsonl`: name,
    arguments, outcome. Refusals and denials are logged too — those are the
    interesting ones.
@@ -92,7 +96,8 @@ Two rules that constrain the whole design:
 Scoped paths are resolved before the check, so `../` cannot walk out of scope.
 `python backend/test_tools.py` exercises the gate: every tier, traversal, and
 the log. `python backend/test_agent.py` covers the loop that drives it, with the
-model faked — including that a confirmation callback actually reaches the gate.
+model faked — including that content the agent *reads* cannot unlock an
+`EXPLICIT` tool, which is the prompt-injection case run end to end.
 
 ---
 
@@ -138,8 +143,8 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
 1. **Memory** — SQLite FTS5 over markdown notes. Hand-editable and inspectable;
    embeddings only if keyword recall demonstrably falls short.
 2. **More tools** — calendar read, scoped screen capture, web search
-   (read-only). Screen capture is the first `EXPLICIT` tool, and nothing sets
-   `user_initiated=True` yet, so it needs that path built with it.
+   (read-only). Screen capture will be the first real `EXPLICIT` tool; the
+   authorisation path it needs is already built and tested.
 3. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
    ASR continuously. Replacing with openWakeWord (near-zero idle compute) →
    VAD-terminated capture instead of a fixed 3s window → Piper for local TTS.
