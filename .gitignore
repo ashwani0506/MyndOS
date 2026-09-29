@@ -48,3 +48,4 @@ backend/models/
 CLAUDE.md
 backend/.env
 backend/logs/
+.claude/

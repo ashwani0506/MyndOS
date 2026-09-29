@@ -5,8 +5,34 @@ Run: python test_brain.py
 
 import os
 import time
+from datetime import time as t
 
 import brain
+
+
+def test_window_bounds_are_inclusive():
+    w = ("16:30", "18:30")
+    assert not brain._in_window(w, t(16, 29))
+    assert brain._in_window(w, t(16, 30))   # inclusive start
+    assert brain._in_window(w, t(17, 0))
+    assert brain._in_window(w, t(18, 30))   # inclusive end
+    assert not brain._in_window(w, t(18, 31))
+    assert not brain._in_window(w, t(4, 30))  # am/pm confusion would show here
+
+
+def test_window_drops_provider_from_chain_outside_hours():
+    os.environ["CLAUDE_API_KEY"] = "x"
+    os.environ["GROQ_API_KEY"] = "x"
+    brain._cooldown.clear()
+
+    claude = brain.PROVIDERS["claude"]
+    assert claude.window, "claude is expected to carry a service window"
+
+    inside = brain._in_window(claude.window)
+    named = "claude" in [p.name for p in brain._chain("deep")]
+    assert named == inside, (
+        f"claude in chain={named} but in-window={inside}; the clock check isn't wired up"
+    )
 
 
 def test_chain_respects_tier_and_order():
@@ -57,6 +83,8 @@ def test_no_providers_raises_rather_than_hanging():
 
 
 if __name__ == "__main__":
+    test_window_bounds_are_inclusive()
+    test_window_drops_provider_from_chain_outside_hours()
     test_chain_respects_tier_and_order()
     test_cooldown_skips_then_restores()
     test_no_providers_raises_rather_than_hanging()
