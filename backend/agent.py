@@ -6,6 +6,7 @@ same Agent object later. Run `python agent.py` for a text REPL.
 
 import json
 from pathlib import Path
+from typing import Callable
 
 import brain
 import tools
@@ -23,8 +24,12 @@ def system_prompt() -> str:
 
 
 class Agent:
-    def __init__(self):
+    def __init__(self, confirm: Callable[..., bool] | None = None):
         self.history: list[dict] = []
+        # How CONFIRM-tier tools ask. None means tools.ask -- the terminal
+        # prompt. The voice loop passes one that speaks first, so a blocking
+        # prompt mid-turn isn't a silent hang.
+        self.confirm = confirm
 
     def say(self, text: str, tier: str = "deep") -> str:
         self.history.append({"role": "user", "content": text})
@@ -46,13 +51,24 @@ class Agent:
                 return msg.content or ""
 
             for call in msg.tool_calls:
-                # user_initiated stays False: these came from the model, which
-                # may have been reasoning over something it read. The gate
-                # refuses EXPLICIT tools here by design -- I have to invoke
-                # those myself.
-                result = tools.execute(
-                    call.function.name, json.loads(call.function.arguments or "{}")
-                )
+                # Every tool_call needs exactly one reply appended, or the next
+                # request 400s on an assistant message with unanswered calls --
+                # so malformed arguments from a small model become a result the
+                # model can read and retry, never an exception.
+                try:
+                    args = json.loads(call.function.arguments or "{}")
+                    if not isinstance(args, dict):
+                        raise ValueError("arguments must be a JSON object")
+                except ValueError as e:  # JSONDecodeError included
+                    result = f"Bad arguments for {call.function.name}: {e}"
+                else:
+                    # user_initiated stays False: these came from the model,
+                    # which may have been reasoning over something it read. The
+                    # gate refuses EXPLICIT tools here by design -- I have to
+                    # invoke those myself.
+                    result = tools.execute(
+                        call.function.name, args, confirm=self.confirm
+                    )
                 self.history.append(
                     {"role": "tool", "tool_call_id": call.id, "content": result}
                 )

@@ -78,8 +78,11 @@ def _log(record: dict) -> None:
         f.write(json.dumps(record, default=str) + "\n")
 
 
-def _ask(t: Tool, args: dict) -> bool:
-    """Default confirmation prompt. Anything but an explicit yes is a no."""
+def ask(t: Tool, args: dict) -> bool:
+    """Default confirmation prompt. Anything but an explicit yes is a no.
+
+    Public because the voice loop wraps it to speak before it blocks.
+    """
     print(f"\n  {t.name}({', '.join(f'{k}={v!r}' for k, v in args.items())})")
     return input("  Allow? [y/N] ").strip().lower() in ("y", "yes")
 
@@ -113,7 +116,7 @@ def execute(
             f"Ask them to invoke it; do not retry."
         )
 
-    if t.risk is Risk.CONFIRM and not (confirm or _ask)(t, args):
+    if t.risk is Risk.CONFIRM and not (confirm or ask)(t, args):
         _log({**entry, "outcome": "denied"})
         return f"{name} was declined by the user. Do not retry."
 

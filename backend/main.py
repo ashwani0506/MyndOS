@@ -8,7 +8,9 @@ from vosk import Model, KaldiRecognizer
 from rolling_buffer import RollingBuffer
 from transcriber import Transcriber
 from tts import tts
-from commands import execute_command
+import brain
+import tools
+from agent import Agent
 
 # Config
 DEVICE = None                  # Default input device
@@ -21,6 +23,31 @@ EXTRA_RECORD_SEC = 3           # extra time after wakeword
 WAKE_WORD = "jarvis"
 
 
+def confirm_aloud(t, args) -> bool:
+    """Speak before blocking on stdin, so a CONFIRM-tier prompt during a voice
+    turn isn't a silent hang with the mic already closed."""
+    tts.speak(f"I need your confirmation to {t.name.replace('_', ' ')}. Check the terminal.")
+    return tools.ask(t, args)
+
+
+def reply(agent: Agent, transcription: str) -> str:
+    """One agent turn. Nothing here may raise -- this loop is meant to survive
+    from login to shutdown, so a bad turn costs a turn, not the assistant.
+
+    ponytail: every command goes to the `deep` tier. No intent router yet, so a
+    "what time is it" pays the same latency as "what do you think of this
+    design". Classify to `fast` once there's something to classify with.
+    """
+    try:
+        return agent.say(transcription) or "I've got nothing useful to say to that."
+    except brain.NoProviderAvailable as e:
+        print(f"[main] {e}", file=sys.stderr)
+        return "I can't reach a model right now."
+    except Exception as e:
+        print(f"[main] {type(e).__name__}: {e}", file=sys.stderr)
+        return f"Something broke: {type(e).__name__}. It's in the terminal."
+
+
 def main():
     print("[main] Loading Vosk model...")
     model = Model(lang="en-us")
@@ -28,6 +55,8 @@ def main():
 
     buffer = RollingBuffer(max_duration=ROLLING_DURATION_SEC, samplerate=SAMPLERATE)
     transcriber = Transcriber()
+    # One Agent for the whole session, so it remembers across wake words.
+    agent = Agent(confirm=confirm_aloud)
 
     q_in = queue.Queue()
 
@@ -94,8 +123,7 @@ def main():
                     print(f"[main] User said: {transcription}")
 
                     if transcription.strip():
-                        tts.speak(f"You said: {transcription}")
-                        execute_command(transcription)
+                        tts.speak(reply(agent, transcription))
                     else:
                         tts.speak("I didn't catch that.")
 

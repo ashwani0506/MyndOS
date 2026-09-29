@@ -19,7 +19,7 @@ status table below is honest about what is built and what isn't.
 | Tools | Clipboard read, scoped file read, confirmed file write. |
 | Persona + user profile | **Working.** Plain markdown, re-read per request. |
 | Text REPL (`agent.py`) | **Working.** Full tool-calling loop. |
-| Command dispatch (voice) | **Placeholder.** Two hardcoded keywords; still on the old path, not yet routed through the execution layer. |
+| Voice → agent | **Working.** `main.py` drives the same `Agent` as the REPL, so every voice command goes through the gate and the log. |
 | Long-term memory | Not built. |
 | Intent router / VAD / local TTS | Not built — voice loop is a rebuild, see Roadmap. |
 
@@ -91,7 +91,8 @@ Two rules that constrain the whole design:
 
 Scoped paths are resolved before the check, so `../` cannot walk out of scope.
 `python backend/test_tools.py` exercises the gate: every tier, traversal, and
-the log.
+the log. `python backend/test_agent.py` covers the loop that drives it, with the
+model faked — including that a confirmation callback actually reaches the gate.
 
 ---
 
@@ -136,14 +137,15 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
 
 1. **Memory** — SQLite FTS5 over markdown notes. Hand-editable and inspectable;
    embeddings only if keyword recall demonstrably falls short.
-2. **Route voice through the execution layer** — `commands.py` still dispatches
-   on two hardcoded keywords and bypasses the gate entirely. It goes next.
-3. **More tools** — calendar read, scoped screen capture (`EXPLICIT`), web
-   search (read-only).
-4. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
+2. **More tools** — calendar read, scoped screen capture, web search
+   (read-only). Screen capture is the first `EXPLICIT` tool, and nothing sets
+   `user_initiated=True` yet, so it needs that path built with it.
+3. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
    ASR continuously. Replacing with openWakeWord (near-zero idle compute) →
    VAD-terminated capture instead of a fixed 3s window → Piper for local TTS.
-5. Persona tuning last.
+   An intent router belongs here too: every command currently pays `deep`-tier
+   latency because there's nothing classifying them.
+4. Persona tuning last.
 
 ---
 
@@ -156,13 +158,13 @@ backend/
   agent.py        conversation loop + text REPL
   persona.md      voice and behaviour (edit freely)
   profile.md      who I am, current projects (edit freely)
-  main.py         voice loop: wake word → STT → dispatch
+  main.py         voice loop: wake word → STT → agent → speech
   transcriber.py  faster-whisper wrapper
   tts.py          shared pyttsx3 engine
   rolling_buffer.py
-  commands.py     placeholder dispatch, being replaced
   test_brain.py   router self-check (no network, no keys needed)
   test_tools.py   gate self-check (no network, no real writes)
+  test_agent.py   tool-loop self-check (brain faked, no network)
   logs/           brain.jsonl, actions.jsonl — gitignored
 ```
 
