@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 import brain
+import memory
 import tools
 
 HERE = Path(__file__).parent
@@ -37,9 +38,13 @@ class Agent:
         # raw utterance before the model sees it. Recomputed every turn, so a
         # grant never outlives the sentence that asked for it.
         unlocked = tools.unlocked_by(text)
+        # Recalled once per turn rather than per hop: the utterance doesn't
+        # change mid-turn, and re-reading the notes each hop would only add
+        # tokens. Empty string when nothing matches.
+        recalled = memory.context(text)
 
         for _ in range(MAX_HOPS):
-            messages = [{"role": "system", "content": system_prompt()}]
+            messages = [{"role": "system", "content": system_prompt() + recalled}]
             # Truncation can cut between an assistant tool_calls message and its
             # replies; a leading orphan "tool" message is a 400 from every API.
             window = self.history[-MAX_TURNS:]

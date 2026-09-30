@@ -48,4 +48,5 @@ backend/models/
 CLAUDE.md
 backend/.env
 backend/logs/
+backend/memory/
 .claude/

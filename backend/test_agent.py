@@ -14,6 +14,7 @@ from pathlib import Path
 
 import agent
 import brain
+import memory
 import tools
 from tools import Risk
 
@@ -149,6 +150,21 @@ def test_nothing_the_model_reads_can_unlock_an_explicit_tool():
     assert "snapped" not in snap["content"]
 
 
+def test_recalled_notes_reach_the_model():
+    """Memory is injected into the system message rather than fetched by a
+    tool hop. If that wiring breaks, the assistant quietly forgets everything
+    and still answers -- nothing else here would fail."""
+    memory.NOTES = Path(tempfile.mkdtemp())
+    (memory.NOTES / "vram.md").write_text("The laptop has 4GB of VRAM.", encoding="utf-8")
+
+    sent = []
+    _script(FakeMsg(content="four gigabytes"), sent=sent)
+    agent.Agent().say("how much vram do I have")
+
+    assert "4GB of VRAM" in sent[0][0]["content"]
+    assert sent[0][0]["role"] == "system"
+
+
 def test_a_confused_model_cannot_loop_forever():
     _script(FakeMsg(tool_calls=[FakeCall("_echo", '{"x": "again"}')]))
     assert "tool loop" in agent.Agent().say("go")
@@ -190,11 +206,12 @@ def test_confirm_callback_reaches_the_gate():
 
 
 if __name__ == "__main__":
-    real_complete, real_log = brain.complete, tools.LOG_PATH
-    # Keep test calls out of the action log I actually read back.
+    real_complete, real_log, real_notes = brain.complete, tools.LOG_PATH, memory.NOTES
+    # Keep test calls out of the action log, and real notes out of the prompts.
     tools.LOG_PATH = Path(tempfile.gettempdir()) / "myndos_test_actions.jsonl"
+    memory.NOTES = Path(tempfile.mkdtemp())
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
             fn()
-    brain.complete, tools.LOG_PATH = real_complete, real_log
+    brain.complete, tools.LOG_PATH, memory.NOTES = real_complete, real_log, real_notes
     print("ok")

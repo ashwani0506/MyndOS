@@ -16,11 +16,11 @@ status table below is honest about what is built and what isn't.
 | Wake word → STT → TTS loop | **Working.** Vosk wake word, faster-whisper transcription, pyttsx3 speech. |
 | Model router (`brain.py`) | **Working.** Tiered, multi-provider, cooldown-aware fallback. |
 | Trusted execution layer (`tools.py`) | **Working.** Risk-tiered registry, confirmation gate, action log. |
-| Tools | Clipboard read, scoped file read, confirmed file write. |
+| Tools | Clipboard read, scoped file read, confirmed file write, remember a fact. |
 | Persona + user profile | **Working.** Plain markdown, re-read per request. |
 | Text REPL (`agent.py`) | **Working.** Full tool-calling loop. |
 | Voice → agent | **Working.** `main.py` drives the same `Agent` as the REPL, so every voice command goes through the gate and the log. |
-| Long-term memory | Not built. |
+| Long-term memory | **Working.** Markdown notes on disk, recalled into the prompt before the model sees the turn. |
 | Intent router / VAD / local TTS | Not built — voice loop is a rebuild, see Roadmap. |
 
 ---
@@ -101,6 +101,36 @@ model faked — including that content the agent *reads* cannot unlock an
 
 ---
 
+## Memory
+
+One fact per markdown file in `backend/memory/`, named by date and first few
+words. The store is the folder: inspecting what it remembers is opening a
+directory, correcting a fact is editing a file, forgetting one is deleting it.
+No database to reconcile against, no export step.
+
+Recall happens **before the model sees the turn**, not as a tool call — the
+utterance is scored against every note and the best three are appended to the
+system prompt. That costs no extra round trip, and it works with a small local
+model that's unreliable at deciding to search.
+
+Scoring is inverse document frequency over the words: a term that appears in
+every note is worth almost nothing, so *"what did I say about the router"*
+isn't dragged around by *"what"* and *"the"*. That's a stopword list I never
+have to maintain, and it adapts to whatever I actually write about.
+
+No index, deliberately. A scan of a few hundred short notes is well under a
+millisecond from page cache, and the version with an index has to handle
+staleness, a database file, and — the one that decided it — escaping. Voice
+transcripts arrive full of apostrophes and dashes, every one of which is a
+syntax error to SQLite's `MATCH`. There is nothing to escape here because
+nothing is a query language.
+
+Recalled notes are wrapped and labelled as recollection, the same way a file
+read is labelled as data. A note can't authorise anything either way — that
+comes from my utterance — but it doesn't get to pose as a system rule.
+
+---
+
 ## Setup
 
 Requires Python 3.12+. Optional but recommended: [Ollama](https://ollama.com)
@@ -140,16 +170,17 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
 
 ## Roadmap
 
-1. **Memory** — SQLite FTS5 over markdown notes. Hand-editable and inspectable;
-   embeddings only if keyword recall demonstrably falls short.
-2. **More tools** — calendar read, scoped screen capture, web search
+1. **More tools** — calendar read, scoped screen capture, web search
    (read-only). Screen capture will be the first real `EXPLICIT` tool; the
    authorisation path it needs is already built and tested.
-3. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
+2. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
    ASR continuously. Replacing with openWakeWord (near-zero idle compute) →
    VAD-terminated capture instead of a fixed 3s window → Piper for local TTS.
    An intent router belongs here too: every command currently pays `deep`-tier
    latency because there's nothing classifying them.
+3. **Recall on demand** — memory is auto-injected only. A `recall` tool would
+   let the model search with a better query than the raw utterance. Worth it
+   once auto-recall measurably misses; not before.
 4. Persona tuning last.
 
 ---
@@ -160,6 +191,7 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
 backend/
   brain.py        model router — tiers, fallback chain, cooldown, service windows
   tools.py        execution layer — risk tiers, confirmation gate, action log
+  memory.py       long-term memory — markdown notes, scored recall, remember tool
   agent.py        conversation loop + text REPL
   persona.md      voice and behaviour (edit freely)
   profile.md      who I am, current projects (edit freely)
@@ -170,6 +202,8 @@ backend/
   test_brain.py   router self-check (no network, no keys needed)
   test_tools.py   gate self-check (no network, no real writes)
   test_agent.py   tool-loop self-check (brain faked, no network)
+  test_memory.py  recall self-check (notes in a temp dir)
+  memory/         one markdown file per remembered fact — gitignored
   logs/           brain.jsonl, actions.jsonl — gitignored
 ```
 
