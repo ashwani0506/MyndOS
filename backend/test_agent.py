@@ -61,20 +61,30 @@ class FakeMsg:
         return {k: v for k, v in d.items() if v is not None} if exclude_none else d
 
 
-def _script(*msgs, sent=None):
+tiers: list[str] = []  # tiers brain.complete saw, reset by each _script call
+
+
+def _script(*msgs, sent=None, routes_to="deep"):
     """Replace brain.complete with one that returns `msgs` in order, recording
-    the messages it was handed into `sent`."""
+    the messages it was handed into `sent`.
+
+    The router is faked too, to `routes_to`. Without that, classification would
+    consume the first scripted message and every test here would be off by one.
+    """
     it = iter(msgs)
     last = msgs[-1]
+    tiers.clear()
 
     def complete(messages, tier="deep", **kwargs):
         if sent is not None:
             sent.append(list(messages))
+        tiers.append(tier)
         return types.SimpleNamespace(
             choices=[types.SimpleNamespace(message=next(it, last))]
         )
 
     brain.complete = complete
+    brain.classify = lambda *a, **k: routes_to
 
 
 def test_a_plain_answer_comes_straight_back():
@@ -150,6 +160,25 @@ def test_nothing_the_model_reads_can_unlock_an_explicit_tool():
     assert "snapped" not in snap["content"]
 
 
+def test_the_router_decides_the_tier_when_the_caller_doesnt():
+    _script(FakeMsg(content="four"), routes_to="fast")
+    agent.Agent().say("what's two plus two")
+    assert tiers == ["fast"], tiers
+
+
+def test_an_explicit_tier_overrides_the_router():
+    """/fast and /deep have to win, and a forced tier shouldn't even pay for
+    the classification call."""
+    _script(FakeMsg(content="four"), routes_to="fast")
+
+    def boom(*a, **k):
+        raise AssertionError("the router ran despite an explicit tier")
+
+    brain.classify = boom
+    agent.Agent().say("what's two plus two", tier="deep")
+    assert tiers == ["deep"]
+
+
 def test_recalled_notes_reach_the_model():
     """Memory is injected into the system message rather than fetched by a
     tool hop. If that wiring breaks, the assistant quietly forgets everything
@@ -206,12 +235,12 @@ def test_confirm_callback_reaches_the_gate():
 
 
 if __name__ == "__main__":
-    real_complete, real_log, real_notes = brain.complete, tools.LOG_PATH, memory.NOTES
+    real = brain.complete, brain.classify, tools.LOG_PATH, memory.NOTES
     # Keep test calls out of the action log, and real notes out of the prompts.
     tools.LOG_PATH = Path(tempfile.gettempdir()) / "myndos_test_actions.jsonl"
     memory.NOTES = Path(tempfile.mkdtemp())
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
             fn()
-    brain.complete, tools.LOG_PATH, memory.NOTES = real_complete, real_log, real_notes
+    brain.complete, brain.classify, tools.LOG_PATH, memory.NOTES = real
     print("ok")

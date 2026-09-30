@@ -34,9 +34,8 @@ def reply(agent: Agent, transcription: str) -> str:
     """One agent turn. Nothing here may raise -- this loop is meant to survive
     from login to shutdown, so a bad turn costs a turn, not the assistant.
 
-    ponytail: every command goes to the `deep` tier. No intent router yet, so a
-    "what time is it" pays the same latency as "what do you think of this
-    design". Classify to `fast` once there's something to classify with.
+    The tier is left to the router inside Agent.say, so a lookup no longer pays
+    reasoning latency.
     """
     try:
         return agent.say(transcription) or "I've got nothing useful to say to that."

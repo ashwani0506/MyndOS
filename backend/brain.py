@@ -13,11 +13,16 @@ A provider that fails (429, auth, network) is skipped for COOLDOWN_SEC rather
 than retried on every call. A provider with a known service `window` is skipped
 outside it on the clock alone. The two compose: the window covers the hours a
 key is reliably dead, the cooldown covers it draining early inside the window.
+
+classify() picks the tier for a turn, so a lookup doesn't pay reasoning
+latency. It only runs when the fast chain starts local, and every unclear
+outcome falls back to `deep` -- see its docstring for why that direction.
 """
 
 import datetime
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,9 +51,13 @@ class Provider:
     def model_for(self, tier: str) -> str | None:
         return self.fast if tier == "fast" else self.deep
 
+    @property
+    def local(self) -> bool:
+        return self.base_url.startswith("http://localhost")
+
     def api_key(self) -> str | None:
         # Local servers need no key but the OpenAI SDK insists on a non-empty one.
-        return os.getenv(self.key_env) or ("local" if self.base_url.startswith("http://localhost") else None)
+        return os.getenv(self.key_env) or ("local" if self.local else None)
 
 
 def _in_window(window: tuple[str, str], now: datetime.time | None = None) -> bool:
@@ -190,6 +199,76 @@ def think(prompt: str, tier: str = "deep", system: str = "", **kwargs) -> str:
         {"role": "user", "content": prompt}
     ]
     return complete(messages, tier=tier, **kwargs).choices[0].message.content or ""
+
+
+# --------------------------------------------------------------------------
+# Intent routing
+# --------------------------------------------------------------------------
+
+CLASSIFY_SYSTEM = """You route requests for a desktop voice assistant.
+
+FAST: a short factual answer, a lookup, a direct instruction, reading or
+acting on something. One obvious right answer, and little cost to being wrong.
+
+DEEP: an opinion, a judgement, a comparison, a plan, a design or code
+question, anything open-ended or multi-step, anything where a wrong answer
+would mislead.
+
+Reply with exactly one word: FAST or DEEP. When in doubt, reply DEEP."""
+
+_THINK = re.compile(r"<think>.*?</think>", re.S)
+
+
+def classify(utterance: str, context: str = "") -> str:
+    """Pick a tier for one turn: "fast" for reflexive, "deep" for reasoning.
+
+    The asymmetry that sets every default here: routing to `deep` when `fast`
+    would have done costs a second of latency, while routing to `fast` when it
+    wouldn't costs a confidently wrong answer spoken aloud. So an unparseable
+    reply, a dead provider, or any exception lands on `deep` -- which is
+    exactly what the assistant did before this function existed.
+    """
+    chain = _chain("fast")
+    if not chain or not chain[0].local:
+        # Classifying over the network costs a round trip to save one, which is
+        # a coin flip at best. ponytail: relax this once brain.jsonl can show
+        # whether a remote classify + fast answer really beats a deep answer.
+        _log({"router": "deep", "why": "fast chain does not start local"})
+        return "deep"
+
+    prompt = f"Request: {utterance}"
+    if context:
+        prompt = f"Your previous reply was: {context}\n\n{prompt}"
+
+    started = time.time()
+    try:
+        # /no_think is Qwen3's switch for skipping its reasoning block, which on
+        # a one-word answer is pure latency. It's also why max_tokens is 32 and
+        # not 2: the template still emits an empty <think></think> pair, and a
+        # reply truncated before the word would fall through to deep every time.
+        answer = think(
+            f"{prompt}\n/no_think",
+            tier="fast",
+            system=CLASSIFY_SYSTEM,
+            max_tokens=32,
+            temperature=0,
+        )
+    except Exception as e:
+        _log({"router": "deep", "why": f"{type(e).__name__}: {e}"})
+        return "deep"
+
+    # Last word wins, so "this isn't FAST, it's DEEP" reads correctly. Neither
+    # word present leaves both at -1, which is not greater than itself: deep.
+    low = _THINK.sub("", answer).lower()
+    tier = "fast" if low.rfind("fast") > low.rfind("deep") else "deep"
+    _log(
+        {
+            "router": tier,
+            "ms": round((time.time() - started) * 1000),
+            "said": low.strip()[:40],
+        }
+    )
+    return tier
 
 
 def status() -> str:

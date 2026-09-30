@@ -14,14 +14,14 @@ status table below is honest about what is built and what isn't.
 | Component | State |
 |---|---|
 | Wake word → STT → TTS loop | **Working.** Vosk wake word, faster-whisper transcription, pyttsx3 speech. |
-| Model router (`brain.py`) | **Working.** Tiered, multi-provider, cooldown-aware fallback. |
+| Model router (`brain.py`) | **Working.** Tiered, multi-provider, cooldown-aware fallback, plus intent routing per turn. |
 | Trusted execution layer (`tools.py`) | **Working.** Risk-tiered registry, confirmation gate, action log. |
 | Tools | Clipboard read, scoped file read, confirmed file write, remember a fact. |
 | Persona + user profile | **Working.** Plain markdown, re-read per request. |
 | Text REPL (`agent.py`) | **Working.** Full tool-calling loop. |
 | Voice → agent | **Working.** `main.py` drives the same `Agent` as the REPL, so every voice command goes through the gate and the log. |
 | Long-term memory | **Working.** Markdown notes on disk, recalled into the prompt before the model sees the turn. |
-| Intent router / VAD / local TTS | Not built — voice loop is a rebuild, see Roadmap. |
+| Intent router / VAD / local TTS | Intent router **working**; VAD and local TTS not built — voice loop is a rebuild, see Roadmap. |
 
 ---
 
@@ -64,6 +64,29 @@ interception — all of which are the reason I did not adopt an off-the-shelf
 routing gateway for this.
 
 Adding a provider is one entry in `PROVIDERS` and one line in `CHAINS`.
+
+### Which tier a turn gets
+
+Every command used to pay `deep`-tier latency, so "what's on my clipboard"
+cost the same as "what do you think of this design". `brain.classify()` now
+picks the tier per turn with a one-word call to the local model, given the
+utterance and the previous reply as context — the context matters, because
+"what do you think?" is four words and looks reflexive on its own.
+
+Two decisions shape it:
+
+- **It only runs when the fast chain starts local.** Classifying over the
+  network costs a round trip to save one, which is a coin flip. Without Ollama
+  the router is a no-op and logs why.
+- **Every unclear outcome is `deep`.** An unparseable reply, a dead provider,
+  an exception — all land on `deep`, which is what the assistant did before the
+  router existed. Wrong towards `deep` costs a second of latency; wrong towards
+  `fast` costs a confidently wrong answer spoken aloud. Those are not the same
+  mistake, so the defaults aren't symmetric.
+
+Each decision is logged to `logs/brain.jsonl` with its latency, which is the
+raw material for the measurement work next on the roadmap. `/fast` and `/deep`
+in the REPL override it.
 
 ---
 
@@ -155,7 +178,8 @@ python backend/agent.py
 ```
 
 `/status` shows which providers are configured and live. `/tools` lists the
-registry with each tool's risk tier. `/fast <message>` forces the cheap tier.
+registry with each tool's risk tier. `/fast <message>` and `/deep <message>`
+override the router for one turn.
 
 Voice mode (wake word "Jarvis"):
 
@@ -170,18 +194,20 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
 
 ## Roadmap
 
-1. **More tools** — calendar read, scoped screen capture, web search
+1. **Measurement** — `logs/brain.jsonl` already records every routing decision
+   and its latency. Nothing reads it back. Without that, "the router made it
+   faster" is a claim, not a number, and the voice rebuild below has no
+   baseline to beat.
+2. **More tools** — calendar read, scoped screen capture, web search
    (read-only). Screen capture will be the first real `EXPLICIT` tool; the
    authorisation path it needs is already built and tested.
-2. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
+3. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
    ASR continuously. Replacing with openWakeWord (near-zero idle compute) →
    VAD-terminated capture instead of a fixed 3s window → Piper for local TTS.
-   An intent router belongs here too: every command currently pays `deep`-tier
-   latency because there's nothing classifying them.
-3. **Recall on demand** — memory is auto-injected only. A `recall` tool would
+4. **Recall on demand** — memory is auto-injected only. A `recall` tool would
    let the model search with a better query than the raw utterance. Worth it
    once auto-recall measurably misses; not before.
-4. Persona tuning last.
+5. Persona tuning last.
 
 ---
 

@@ -32,7 +32,21 @@ class Agent:
         # prompt mid-turn isn't a silent hang.
         self.confirm = confirm
 
-    def say(self, text: str, tier: str = "deep") -> str:
+    def say(self, text: str, tier: str | None = None) -> str:
+        # Routed before the turn goes into history, so the classifier sees the
+        # last reply as context rather than the sentence it's classifying.
+        # An explicit tier from a caller wins -- that's /fast and /deep.
+        if tier is None:
+            prev = next(
+                (
+                    m["content"]
+                    for m in reversed(self.history)
+                    if m["role"] == "assistant" and m.get("content")
+                ),
+                "",
+            )
+            tier = brain.classify(text, prev[:300])
+
         self.history.append({"role": "user", "content": text})
         # Which EXPLICIT tools this turn is allowed to use, computed from the
         # raw utterance before the model sees it. Recomputed every turn, so a
@@ -91,7 +105,8 @@ class Agent:
 def main():
     agent = Agent()
     print("MyndOS (text mode). '/status' for providers, '/tools' for the "
-          "registry, '/fast <msg>' for the cheap tier, Ctrl-C to quit.\n")
+          "registry, '/fast <msg>' or '/deep <msg>' to override the router, "
+          "Ctrl-C to quit.\n")
     print(brain.status(), "\n")
 
     while True:
@@ -112,9 +127,10 @@ def main():
             print()
             continue
 
-        tier = "deep"
-        if text.startswith("/fast "):
-            tier, text = "fast", text[6:]
+        tier = None  # None means let the router pick
+        for t in ("fast", "deep"):
+            if text.startswith(f"/{t} "):
+                tier, text = t, text[len(t) + 2:]
 
         try:
             print(f"\n{agent.say(text, tier=tier)}\n")

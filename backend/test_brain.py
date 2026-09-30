@@ -4,8 +4,10 @@ Run: python test_brain.py
 """
 
 import os
+import tempfile
 import time
 from datetime import time as t
+from pathlib import Path
 
 import brain
 
@@ -82,10 +84,103 @@ def test_no_providers_raises_rather_than_hanging():
         raise AssertionError("expected NoProviderAvailable")
 
 
+# --------------------------------------------------------------------------
+# Intent routing. brain.think is faked; nothing here reaches a model.
+# --------------------------------------------------------------------------
+
+
+def _answers(text, *, boom=False):
+    """Fake brain.think. Records the calls it received into the returned list."""
+    calls = []
+
+    def fake(prompt, tier="deep", system="", **kwargs):
+        calls.append({"prompt": prompt, "tier": tier, "system": system, **kwargs})
+        if boom:
+            raise RuntimeError("model died")
+        return text
+
+    brain.think = fake
+    return calls
+
+
+def _local_fast_chain():
+    """Make the fast chain start on ollama, which is what classify requires."""
+    brain._cooldown.clear()
+    assert brain._chain("fast")[0].local, "expected ollama at the head of fast"
+
+
+def test_a_reflexive_request_routes_to_fast():
+    _local_fast_chain()
+    calls = _answers("FAST")
+    assert brain.classify("what's on my clipboard") == "fast"
+    assert calls[0]["tier"] == "fast", "classification must not use the deep tier"
+
+
+def test_an_open_ended_request_routes_to_deep():
+    _local_fast_chain()
+    _answers("DEEP")
+    assert brain.classify("what do you think of this architecture") == "deep"
+
+
+def test_a_thinking_model_reply_is_still_parsed():
+    """qwen3 wraps answers in <think> blocks. /no_think asks it not to, but the
+    template still emits the tags, and a stray "deep" inside them would flip
+    the decision if they weren't stripped."""
+    _local_fast_chain()
+    _answers("<think>\nis this deep? no.\n</think>\n\nFAST")
+    assert brain.classify("what time is it") == "fast"
+
+
+def test_the_last_word_wins():
+    """A chatty model saying "not FAST, this is DEEP" must not read as fast."""
+    _local_fast_chain()
+    _answers("This isn't FAST, it's DEEP.")
+    assert brain.classify("design me a schema") == "deep"
+
+
+def test_an_unparseable_reply_falls_back_to_deep():
+    """Wrong towards deep costs a second. Wrong towards fast costs a confident
+    bad answer spoken aloud, so every unclear case has to land here."""
+    _local_fast_chain()
+    _answers("I'm not sure what you mean?")
+    assert brain.classify("anything") == "deep"
+
+
+def test_a_dead_classifier_falls_back_to_deep():
+    _local_fast_chain()
+    _answers("FAST", boom=True)
+    assert brain.classify("what's on my clipboard") == "deep"
+
+
+def test_classify_does_not_pay_a_network_hop_to_save_one():
+    """With no local model the classify call itself goes over the network, so
+    routing would cost a round trip to save one. Bail without calling."""
+    os.environ["GROQ_API_KEY"] = "x"
+    brain._cooldown.clear()
+    brain._cooldown["ollama"] = time.time() + brain.COOLDOWN_SEC
+    assert not brain._chain("fast")[0].local
+
+    calls = _answers("FAST")
+    assert brain.classify("what's on my clipboard") == "deep"
+    assert calls == [], "classified over the network"
+
+
+def test_previous_reply_is_offered_as_context():
+    """"What do you think?" is four words and looks reflexive on its own."""
+    _local_fast_chain()
+    calls = _answers("DEEP")
+    brain.classify("what do you think", "I'd use SQLite over Postgres here.")
+    assert "SQLite over Postgres" in calls[0]["prompt"]
+
+
 if __name__ == "__main__":
-    test_window_bounds_are_inclusive()
-    test_window_drops_provider_from_chain_outside_hours()
-    test_chain_respects_tier_and_order()
-    test_cooldown_skips_then_restores()
-    test_no_providers_raises_rather_than_hanging()
+    real_think, real_log = brain.think, brain.LOG_PATH
+    brain.LOG_PATH = Path(tempfile.gettempdir()) / "myndos_test_brain.jsonl"
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_"):
+            # Restored per test, not once at the end: the routing tests fake
+            # think(), and test_no_providers calls it for real.
+            brain.think = real_think
+            fn()
+    brain.think, brain.LOG_PATH = real_think, real_log
     print("ok")
