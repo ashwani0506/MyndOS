@@ -105,8 +105,8 @@ class Agent:
 def main():
     agent = Agent()
     print("MyndOS (text mode). '/status' for providers, '/tools' for the "
-          "registry, '/fast <msg>' or '/deep <msg>' to override the router, "
-          "Ctrl-C to quit.\n")
+          "registry, '/stats' for routing and latency, '/fast <msg>' or "
+          "'/deep <msg>' to override the router, Ctrl-C to quit.\n")
     print(brain.status(), "\n")
 
     while True:
@@ -125,6 +125,11 @@ def main():
             for t in tools.REGISTRY.values():
                 print(f"  {t.name:<16} [{t.risk.value:<8}] {t.description}")
             print()
+            continue
+        if text == "/stats":
+            import measure  # local: the loop doesn't need it until asked
+
+            print(f"\n{measure.report(*measure.load())}\n")
             continue
 
         tier = None  # None means let the router pick

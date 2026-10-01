@@ -21,6 +21,7 @@ status table below is honest about what is built and what isn't.
 | Text REPL (`agent.py`) | **Working.** Full tool-calling loop. |
 | Voice → agent | **Working.** `main.py` drives the same `Agent` as the REPL, so every voice command goes through the gate and the log. |
 | Long-term memory | **Working.** Markdown notes on disk, recalled into the prompt before the model sees the turn. |
+| Measurement (`measure.py`) | **Working.** Reads the brain log back: tier latency, routing split, and whether the router nets out positive. |
 | Intent router / VAD / local TTS | Intent router **working**; VAD and local TTS not built — voice loop is a rebuild, see Roadmap. |
 
 ---
@@ -84,9 +85,33 @@ Two decisions shape it:
   `fast` costs a confidently wrong answer spoken aloud. Those are not the same
   mistake, so the defaults aren't symmetric.
 
-Each decision is logged to `logs/brain.jsonl` with its latency, which is the
-raw material for the measurement work next on the roadmap. `/fast` and `/deep`
-in the REPL override it.
+Each decision is logged to `logs/brain.jsonl` with its latency. `/fast` and
+`/deep` in the REPL override it.
+
+### Does the router pay for itself
+
+`measure.py` reads the log back and answers that, because the router was built
+on an argument and an argument isn't a number:
+
+```bash
+python backend/measure.py      # or /stats in the REPL
+```
+
+It reports p50/p95 latency per tier, what classification costs, the fast/deep
+split, and a per-turn net. Three things it does deliberately:
+
+- **Classification is excluded from fast-tier answer latency.** It's a
+  fast-tier call that isn't a fast-tier answer, and counting them together
+  would make the router look like it pays for itself whether or not it does.
+- **Percentiles, not means.** One cold model load drags a mean somewhere no
+  real turn ever was.
+- **It can return a verdict against the router.** If classifying costs more
+  than the tier gap saves, the report says so in those words. A measurement
+  that can only confirm the decision isn't a measurement.
+
+What it can't measure is whether a given decision was *correct* — turns routed
+`fast` are easier turns, so the comparison is observational, and the report
+labels itself as an estimate rather than an experiment.
 
 ---
 
@@ -178,8 +203,8 @@ python backend/agent.py
 ```
 
 `/status` shows which providers are configured and live. `/tools` lists the
-registry with each tool's risk tier. `/fast <message>` and `/deep <message>`
-override the router for one turn.
+registry with each tool's risk tier. `/stats` reports routing and latency.
+`/fast <message>` and `/deep <message>` override the router for one turn.
 
 Voice mode (wake word "Jarvis"):
 
@@ -194,20 +219,20 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
 
 ## Roadmap
 
-1. **Measurement** — `logs/brain.jsonl` already records every routing decision
-   and its latency. Nothing reads it back. Without that, "the router made it
-   faster" is a claim, not a number, and the voice rebuild below has no
-   baseline to beat.
-2. **More tools** — calendar read, scoped screen capture, web search
-   (read-only). Screen capture will be the first real `EXPLICIT` tool; the
-   authorisation path it needs is already built and tested.
-3. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
+1. **More tools** — calendar read, scoped screen capture, web search
+   (read-only). Calendar goes in over a published secret ICS URL rather than
+   OAuth: read-only is all the permission tiers allow unprompted anyway, so an
+   Azure app registration and a token refresh held by a login-start process buy
+   nothing until something needs to *write*. Screen capture will be the first
+   real `EXPLICIT` tool; the authorisation path it needs is already built and
+   tested.
+2. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
    ASR continuously. Replacing with openWakeWord (near-zero idle compute) →
    VAD-terminated capture instead of a fixed 3s window → Piper for local TTS.
-4. **Recall on demand** — memory is auto-injected only. A `recall` tool would
+3. **Recall on demand** — memory is auto-injected only. A `recall` tool would
    let the model search with a better query than the raw utterance. Worth it
    once auto-recall measurably misses; not before.
-5. Persona tuning last.
+4. Persona tuning last.
 
 ---
 
@@ -218,6 +243,7 @@ backend/
   brain.py        model router — tiers, fallback chain, cooldown, service windows
   tools.py        execution layer — risk tiers, confirmation gate, action log
   memory.py       long-term memory — markdown notes, scored recall, remember tool
+  measure.py      reads brain.jsonl back — tier latency, routing split, net
   agent.py        conversation loop + text REPL
   persona.md      voice and behaviour (edit freely)
   profile.md      who I am, current projects (edit freely)
@@ -229,6 +255,7 @@ backend/
   test_tools.py   gate self-check (no network, no real writes)
   test_agent.py   tool-loop self-check (brain faked, no network)
   test_memory.py  recall self-check (notes in a temp dir)
+  test_measure.py report self-check (synthetic log in a temp dir)
   memory/         one markdown file per remembered fact — gitignored
   logs/           brain.jsonl, actions.jsonl — gitignored
 ```

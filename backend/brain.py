@@ -147,11 +147,15 @@ def _chain(tier: str) -> list[Provider]:
     return out
 
 
-def complete(messages: list[dict], tier: str = "deep", **kwargs):
+def complete(messages: list[dict], tier: str = "deep", purpose: str = "answer", **kwargs):
     """Send `messages` to the first provider in `tier`'s chain that answers.
 
     Returns the raw completion so callers can read tool_calls. Use think() if
     you only want text.
+
+    `purpose` only reaches the log. It's there because a classification is a
+    fast-tier call that isn't a fast-tier *answer*, and measuring them together
+    would make the router look like it pays for itself when it might not.
 
     ponytail: a provider that rejects a kwarg (an older endpoint with no tool
     support, say) fails like any other error and eats a cooldown. Acceptable
@@ -175,6 +179,7 @@ def complete(messages: list[dict], tier: str = "deep", **kwargs):
             _log(
                 {
                     "tier": tier,
+                    "purpose": purpose,
                     "provider": p.name,
                     "model": p.model_for(tier),
                     "ms": round((time.time() - started) * 1000),
@@ -186,7 +191,15 @@ def complete(messages: list[dict], tier: str = "deep", **kwargs):
         except Exception as e:
             _cooldown[p.name] = time.time() + COOLDOWN_SEC
             errors.append(f"{p.name}: {type(e).__name__}: {e}")
-            _log({"tier": tier, "provider": p.name, "ok": False, "error": str(e)})
+            _log(
+                {
+                    "tier": tier,
+                    "purpose": purpose,
+                    "provider": p.name,
+                    "ok": False,
+                    "error": str(e),
+                }
+            )
 
     raise NoProviderAvailable(
         f"Every provider for tier {tier!r} failed:\n  " + "\n  ".join(errors)
@@ -250,6 +263,7 @@ def classify(utterance: str, context: str = "") -> str:
             f"{prompt}\n/no_think",
             tier="fast",
             system=CLASSIFY_SYSTEM,
+            purpose="classify",
             max_tokens=32,
             temperature=0,
         )
