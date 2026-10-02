@@ -1,5 +1,4 @@
 import pyttsx3
-import asyncio
 import threading
 
 class TTS:
@@ -23,13 +22,6 @@ class TTS:
         with self._lock:
             self.engine.say(text)
             self.engine.runAndWait()
-
-    async def speak_async(self, text):
-        """
-        Asynchronous wrapper around speak().
-        """
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.speak, text)
 
 
 # Shared engine. pyttsx3/SAPI5 deadlocks if two engines run concurrently,

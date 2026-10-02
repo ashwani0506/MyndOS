@@ -10,6 +10,7 @@ from transcriber import Transcriber
 from tts import tts
 import brain
 import tools
+import vad
 from agent import Agent
 
 # Config
@@ -18,16 +19,20 @@ SAMPLERATE = 16000
 CHANNELS = 1
 BLOCKSIZE = 8000               # 0.5 seconds per chunk
 ROLLING_DURATION_SEC = 10      # store last N seconds of audio
-EXTRA_RECORD_SEC = 3           # extra time after wakeword
+PRE_ROLL_SEC = 3               # how much of the buffer reaches Whisper
 
 WAKE_WORD = "jarvis"
 
 
 def confirm_aloud(t, args) -> bool:
-    """Speak before blocking on stdin, so a CONFIRM-tier prompt during a voice
-    turn isn't a silent hang with the mic already closed."""
-    tts.speak(f"I need your confirmation to {t.name.replace('_', ' ')}. Check the terminal.")
-    return tools.ask(t, args)
+    """Speak, then put the question somewhere he can actually answer it.
+
+    A voice turn has no terminal in front of it -- started at login there is no
+    terminal at all -- so `tools.ask` would block on stdin forever and take the
+    whole loop with it. `ask_dialog` is a window, and fails closed.
+    """
+    tts.speak(f"I need your confirmation to {t.name.replace('_', ' ')}.")
+    return tools.ask_dialog(t, args)
 
 
 def reply(agent: Agent, transcription: str) -> str:
@@ -109,16 +114,25 @@ def main():
                     # Stop mic so TTS doesn't leak into audio
                     stop_stream()
 
+                    # Measured before the acknowledgement, off the whole
+                    # buffer: ten seconds of the actual room is a better
+                    # sample of it than anything measurable after.
+                    level = vad.threshold(
+                        vad.noise_floor(buffer.get_audio(), SAMPLERATE)
+                    )
+
                     tts.speak("Yes, sir")
 
-                    # Capture extra audio after wake word
-                    additional_audio = capture_extra_audio(EXTRA_RECORD_SEC)
+                    command = record_command(level)
+                    print(f"[vad] recorded {len(command) / (SAMPLERATE * 2):.1f}s")
 
-                    # Combine rolling buffer + new audio
-                    audio_to_transcribe = buffer.get_audio() + additional_audio
+                    # Pre-roll, because Vosk only fires once an utterance ends
+                    # -- "what time is it, jarvis" is already spoken by then.
+                    # Three seconds covers that; the other seven are the room.
+                    audio_to_transcribe = buffer.tail(PRE_ROLL_SEC) + command
 
                     # Transcribe
-                    transcription = run_transcription(transcriber, audio_to_transcribe)
+                    transcription = transcriber.transcribe_bytes(audio_to_transcribe)
                     print(f"[main] User said: {transcription}")
 
                     if transcription.strip():
@@ -138,28 +152,24 @@ def main():
         stop_stream()
 
 
-def capture_extra_audio(duration_sec):
-    """Record a few extra seconds after wake word is detected."""
-    print(f"[main] Capturing additional {duration_sec} seconds of audio...")
-    frames = int(duration_sec * SAMPLERATE)
-    audio = sd.rec(frames, samplerate=SAMPLERATE, channels=CHANNELS, dtype='float32')
-    sd.wait()
-    data = audio.flatten()
-    data_bytes = (data * 32767).astype(np.int16).tobytes()
-    return data_bytes
+def record_command(level):
+    """Record until he stops talking, rather than for a fixed three seconds.
 
-
-def run_transcription(transcriber, audio_bytes):
+    A dedicated int16 stream, read a frame at a time: the resident stream is
+    float32 with half-second blocks for Vosk's benefit, and neither suits a
+    30ms decision. Reading int16 directly also drops the rescaling the
+    callback has to do.
     """
-    Helper to run asynchronous transcription synchronously for main.py context.
-    """
-    import asyncio
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(transcriber.transcribe_bytes(audio_bytes))
-    loop.close()
-    return result
+    n = int(SAMPLERATE * vad.FRAME_MS / 1000)
+    stream = sd.InputStream(
+        device=DEVICE, channels=CHANNELS, samplerate=SAMPLERATE, dtype='int16'
+    )
+    stream.start()
+    try:
+        return vad.capture(lambda: stream.read(n)[0].tobytes(), level)
+    finally:
+        stream.stop()
+        stream.close()
 
 
 if __name__ == "__main__":

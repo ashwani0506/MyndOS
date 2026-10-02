@@ -22,7 +22,7 @@ status table below is honest about what is built and what isn't.
 | Voice → agent | **Working.** `main.py` drives the same `Agent` as the REPL, so every voice command goes through the gate and the log. |
 | Long-term memory | **Working.** Markdown notes on disk, recalled into the prompt before the model sees the turn. |
 | Measurement (`measure.py`) | **Working.** Reads the brain log back: tier latency, routing split, and whether the router nets out positive. |
-| Intent router / VAD / local TTS | Intent router **working**; VAD and local TTS not built — voice loop is a rebuild, see Roadmap. |
+| Intent router / VAD / local TTS | Intent router and VAD **working**; wake word and TTS are still Vosk and pyttsx3 — see Roadmap. |
 
 ---
 
@@ -115,6 +115,48 @@ labels itself as an estimate rather than an experiment.
 
 ---
 
+## Knowing when he stopped talking
+
+The loop used to record for exactly three seconds after the wake word, so
+*"what time is it"* and a twelve-word question cost the same wall clock — and
+the short one, which is most of them, paid for silence. That fixed window is
+larger than the entire tier gap the router exists to save, which is why this
+came before any further work on the model layer.
+
+`vad.py` ends the capture after 0.7s of quiet instead. Energy-based, ~40 lines,
+no new dependency — numpy was already here for the audio path.
+
+Two things make it work rather than merely exist:
+
+- **The threshold is calibrated per command, not hard-coded.** A laptop fan, an
+  air conditioner and a quiet room are three different rooms. The level is read
+  off the audio already sitting in the rolling buffer — ambient by definition,
+  since it is what the mic heard *before* the wake word. It's the 20th
+  percentile of frame loudness rather than the mean, because that buffer ends
+  with the wake word and so isn't pure ambience; a mean would be dragged up by
+  the speech in it and set a threshold that then ignores the next sentence.
+- **Only quiet *after* speech ends the capture.** A pause for breath is shorter
+  than the hang time, which is the whole reason that constant isn't smaller.
+  Cutting someone off mid-sentence is a worse failure than half a second of
+  latency, so the two aren't tuned symmetrically.
+
+`capture()` takes its frame reader as an argument, so `test_vad.py` scripts a
+microphone out of a string — `"!!..!!!"` is a sentence with a pause in it — and
+the whole decision is testable with no audio device. The two tests that matter
+are the two failure modes: cutting him off at a pause, and recording an empty
+room until the ceiling.
+
+Whisper now sees 3s of pre-roll plus the command instead of a flat 13s. The
+pre-roll is load-bearing rather than padding: Vosk only reports an utterance
+once it has ended, so by the time *"what time is it, jarvis"* fires the wake
+word, the command has already been spoken.
+
+ponytail: RMS can't tell speech from a slammed door, so a loud noise can hold
+the capture open to its ceiling. Fine for a desk mic in a room with one person;
+`webrtcvad` classifies frames of the same size if that stops being true.
+
+---
+
 ## Security model
 
 The assistant runs as a normal user account and never requests elevation.
@@ -140,6 +182,21 @@ Two rules that constrain the whole design:
 2. **Every tool call is logged** to `backend/logs/actions.jsonl`: name,
    arguments, outcome. Refusals and denials are logged too — those are the
    interesting ones.
+
+### Asking in a place I can answer
+
+The confirmation prompt is a terminal question in the REPL and a window
+(`ask_dialog`, stdlib tkinter) on the voice path. That split isn't cosmetic:
+this is meant to start at login, where there is no terminal attached, so a
+`stdin` prompt would block forever on input that can never arrive — hanging
+the assistant and taking the confirmation gate down with it. **A gate that
+hangs is a gate that gets removed**, which is the actual failure mode.
+
+The dialog fails closed in every direction. Closing it, Escape, a 60s timeout
+and Tk failing to open at all are each a *no*; the only yes is a click on
+Allow. There's deliberately no keyboard default — Enter on a dialog I didn't
+read shouldn't be able to send an email — and no fallback to `input()` when Tk
+is unavailable, since that would reintroduce the hang this exists to remove.
 
 Scoped paths are resolved before the check, so `../` cannot walk out of scope.
 `python backend/test_tools.py` exercises the gate: every tier, traversal, and
@@ -181,8 +238,13 @@ comes from my utterance — but it doesn't get to pose as a system rule.
 
 ## Setup
 
-Requires Python 3.12+. Optional but recommended: [Ollama](https://ollama.com)
-for the local tier.
+Requires Python 3.12+, and [Ollama](https://ollama.com) if you want the parts
+of this that depend on a local model. It's optional in the sense that nothing
+crashes without it, but two things quietly switch off: there is no offline
+floor, so an exhausted quota means no assistant rather than a slower one, and
+**intent routing stops entirely** — `classify()` refuses to classify over the
+network, so every turn pays deep latency. `/status` says so in those words
+when it happens, rather than leaving you to infer it.
 
 ```bash
 pip install -r backend/requirements.txt
@@ -226,9 +288,10 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
    nothing until something needs to *write*. Screen capture will be the first
    real `EXPLICIT` tool; the authorisation path it needs is already built and
    tested.
-2. **Voice rebuild** — the current loop takes ~6–8s to first action and runs full
-   ASR continuously. Replacing with openWakeWord (near-zero idle compute) →
-   VAD-terminated capture instead of a fixed 3s window → Piper for local TTS.
+2. **Voice rebuild** — VAD-terminated capture is in. Still to go: openWakeWord
+   replacing Vosk (which runs full ASR continuously just to hear one word),
+   Piper replacing pyttsx3, and a spoken filler on `deep` turns so a 2s think
+   doesn't read as a hang.
 3. **Recall on demand** — memory is auto-injected only. A `recall` tool would
    let the model search with a better query than the raw utterance. Worth it
    once auto-recall measurably misses; not before.
@@ -248,6 +311,7 @@ backend/
   persona.md      voice and behaviour (edit freely)
   profile.md      who I am, current projects (edit freely)
   main.py         voice loop: wake word → STT → agent → speech
+  vad.py          ends a capture when he stops talking, on a calibrated level
   transcriber.py  faster-whisper wrapper
   tts.py          shared pyttsx3 engine
   rolling_buffer.py
@@ -256,6 +320,7 @@ backend/
   test_agent.py   tool-loop self-check (brain faked, no network)
   test_memory.py  recall self-check (notes in a temp dir)
   test_measure.py report self-check (synthetic log in a temp dir)
+  test_vad.py     capture self-check (microphone scripted from a string)
   memory/         one markdown file per remembered fact — gitignored
   logs/           brain.jsonl, actions.jsonl — gitignored
 ```

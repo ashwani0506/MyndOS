@@ -13,10 +13,10 @@ class Transcriber:
             device=device
         )
 
-    async def transcribe(self,
-                         audio_data: np.ndarray,
-                         language="en",
-                         beam_size=1) -> str:
+    def transcribe(self,
+                   audio_data: np.ndarray,
+                   language="en",
+                   beam_size=1) -> str:
         """
         Transcribes raw PCM audio samples (int16) using Faster-Whisper.
 
@@ -48,10 +48,10 @@ class Transcriber:
         print(f"[transcriber] Transcript: {transcript}")
         return transcript
 
-    async def transcribe_bytes(self,
-                               audio_bytes: bytes,
-                               language="en",
-                               beam_size=1) -> str:
+    def transcribe_bytes(self,
+                         audio_bytes: bytes,
+                         language="en",
+                         beam_size=1) -> str:
         """
         Converts raw bytes to numpy array and transcribes them.
 
@@ -69,4 +69,4 @@ class Transcriber:
 
         # Convert bytes → numpy array of int16
         audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-        return await self.transcribe(audio_array, language=language, beam_size=beam_size)
+        return self.transcribe(audio_array, language=language, beam_size=beam_size)
