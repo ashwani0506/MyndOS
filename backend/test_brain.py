@@ -4,6 +4,7 @@ Run: python test_brain.py
 """
 
 import os
+import socket
 import tempfile
 import time
 from datetime import time as t
@@ -82,6 +83,27 @@ def test_no_providers_raises_rather_than_hanging():
         pass
     else:
         raise AssertionError("expected NoProviderAvailable")
+
+
+def test_status_does_not_report_a_dead_local_port_as_ready():
+    """A local server needs no key, so every other check passes for one that
+    isn't installed -- and status() called it "ready" while the router it
+    fronts silently did nothing. Loopback only; no network."""
+    assert not brain._listening("http://localhost:1/v1")
+
+    with socket.socket() as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        assert brain._listening(f"http://127.0.0.1:{srv.getsockname()[1]}/v1")
+
+
+def test_status_says_so_when_routing_is_off():
+    """With no local model the router returns deep on every turn. That has to
+    be visible in /status, not inferred from a log full of skips."""
+    os.environ["GROQ_API_KEY"] = "x"
+    brain._cooldown.clear()
+    brain._cooldown["ollama"] = time.time() + brain.COOLDOWN_SEC
+    assert "Intent routing is OFF" in brain.status()
 
 
 # --------------------------------------------------------------------------

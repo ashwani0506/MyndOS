@@ -23,9 +23,11 @@ import datetime
 import json
 import os
 import re
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -68,6 +70,27 @@ def _in_window(window: tuple[str, str], now: datetime.time | None = None) -> boo
     """
     start, end = (datetime.time.fromisoformat(t) for t in window)
     return start <= (now or datetime.datetime.now().time()) <= end
+
+
+def _listening(base_url: str, timeout: float = 0.2) -> bool:
+    """Is anything actually accepting connections there?
+
+    Only asked of local providers, and only by status(). A local server needs
+    no key, so api_key() hands one out unconditionally -- which means every
+    other check passes for a provider that isn't installed, and status()
+    reports a dead port as "ready". That is a lie in the one place whose whole
+    job is telling you what is live.
+
+    Not wired into _chain(): a refused connection to localhost costs under a
+    millisecond and the cooldown absorbs it, so paying a probe on every call to
+    save that would be the more expensive mistake.
+    """
+    url = urlparse(base_url)
+    try:
+        with socket.create_connection((url.hostname, url.port or 80), timeout):
+            return True
+    except OSError:
+        return False
 
 
 PROVIDERS = {
@@ -292,6 +315,10 @@ def status() -> str:
     for name, p in PROVIDERS.items():
         if not p.api_key():
             state = f"no key ({p.key_env})"
+        elif p.local and not _listening(p.base_url):
+            # Checked before the cooldown, because "not running" is the cause
+            # and "cooling down" is only its symptom.
+            state = f"NOT RUNNING -- nothing listening on {p.base_url}"
         elif p.window and not _in_window(p.window):
             state = f"outside window {p.window[0]}-{p.window[1]}"
         elif _cooldown.get(name, 0) > now:
@@ -300,4 +327,14 @@ def status() -> str:
             state = "ready"
         tiers = ",".join(t for t in ("fast", "deep") if p.model_for(t))
         lines.append(f"  {name:<11} [{tiers:<9}] {state}")
+
+    # The fast chain starting local is the precondition for routing at all, so
+    # when it isn't met, say so here rather than leaving it to be inferred from
+    # a log full of skips.
+    chain = _chain("fast")
+    if not chain or not chain[0].local:
+        lines.append(
+            "\n  Intent routing is OFF: the fast chain does not start local,\n"
+            "  so every turn pays deep latency. /stats has the damage."
+        )
     return "\n".join(lines)
