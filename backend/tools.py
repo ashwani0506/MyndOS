@@ -128,6 +128,27 @@ def ask(t: Tool, args: dict) -> bool:
 
 
 CONFIRM_TIMEOUT_SEC = 60
+PREVIEW_CHARS = 300
+
+
+def _preview(value) -> str:
+    """One argument, short enough to put in a dialog.
+
+    Not cosmetic. `write_file` takes the whole new file as an argument, and a
+    label holding five thousand characters makes a window taller than the
+    screen -- which, since the dialog is fixed-size and always-on-top, puts the
+    Allow and Deny buttons somewhere unclickable. It still fails closed (Escape
+    and the timeout both deny), so the bug was "cannot approve a long write"
+    rather than "approves without asking", but a gate that can only say no to
+    the common case is a gate that gets switched off.
+
+    Truncating also happens to be the preview: the first 300 characters of a
+    file is most of what tells you whether it's the file you meant.
+    """
+    s = repr(value)
+    if len(s) <= PREVIEW_CHARS:
+        return s
+    return f"{s[:PREVIEW_CHARS]}... (+{len(str(value)) - PREVIEW_CHARS} more chars)"
 
 
 def ask_dialog(t: Tool, args: dict) -> bool:
@@ -147,6 +168,14 @@ def ask_dialog(t: Tool, args: dict) -> bool:
     Tk is not thread-safe, so this must run on the main thread. It does: the
     voice loop drives the agent from main(), and the audio callback never
     reaches the gate.
+
+    ponytail: shows the call's *arguments*, not its *effect* -- "write_file,
+    path=notes.md" doesn't say notes.md already holds 400 lines about to be
+    gone. Deliberate: the dialog works for every CONFIRM tool because it knows
+    what none of them mean, and teaching it write_file's semantics starts a
+    special case per tool. Give Tool an optional `preview` callable returning
+    one string and display that instead, when a tool lands whose arguments
+    genuinely don't imply the consequence (a delete, a push).
     """
     import tkinter as tk
 
@@ -170,7 +199,7 @@ def ask_dialog(t: Tool, args: dict) -> bool:
     root.protocol("WM_DELETE_WINDOW", root.destroy)  # the X is a no
     root.bind("<Escape>", lambda _: root.destroy())
 
-    detail = "\n".join(f"{k} = {v!r}" for k, v in args.items()) or "(no arguments)"
+    detail = "\n".join(f"{k} = {_preview(v)}" for k, v in args.items()) or "(no arguments)"
     tk.Label(
         root, text=t.description, wraplength=440, justify="left",
         font=("", 10, "bold"),

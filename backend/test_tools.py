@@ -149,6 +149,21 @@ def test_write_file_is_confirm_tier():
         assert p.read_text() == "hi"
 
 
+def test_a_long_argument_cannot_push_the_buttons_off_the_screen():
+    """write_file's argument *is* the whole file. Rendered in full, the dialog
+    grows taller than the screen -- and it's fixed-size and always-on-top, so
+    Allow and Deny end up unclickable. Fails closed, but a gate that can only
+    say no to the common case is a gate that gets switched off."""
+    short = tools._preview("notes.md")
+    assert short == "'notes.md'", short
+
+    long = tools._preview("x" * 5000)
+    assert len(long) < tools.PREVIEW_CHARS + 40, "truncation didn't bound the label"
+    assert "4700 more" in long, long
+    # The first few hundred chars survive -- that truncation is the preview.
+    assert long.startswith("'xxx")
+
+
 def test_a_dialog_that_cannot_open_is_a_no():
     """Fail-closed, which is the whole reason the dialog exists.
 
