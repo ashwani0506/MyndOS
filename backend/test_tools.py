@@ -149,6 +149,33 @@ def test_write_file_is_confirm_tier():
         assert p.read_text() == "hi"
 
 
+def test_a_dialog_that_cannot_open_is_a_no():
+    """Fail-closed, which is the whole reason the dialog exists.
+
+    `ask` blocks on stdin, so at login with no terminal a CONFIRM tool hung the
+    voice loop forever. A dialog that can't open must refuse -- falling back to
+    input() would reintroduce exactly that hang. Stubbed rather than real: a
+    self-check must not pop a window and wait for a human.
+    """
+    import sys
+    import types
+
+    def boom():
+        raise RuntimeError("no display")
+
+    stub = types.ModuleType("tkinter")
+    stub.Tk = boom
+    real = sys.modules.get("tkinter")
+    sys.modules["tkinter"] = stub
+    try:
+        assert tools.ask_dialog(tools.REGISTRY["_confirm"], {}) is False
+    finally:
+        if real is None:
+            del sys.modules["tkinter"]
+        else:
+            sys.modules["tkinter"] = real
+
+
 def test_schemas_cover_every_tool():
     names = {s["function"]["name"] for s in tools.schemas()}
     assert names == set(tools.REGISTRY)

@@ -127,6 +127,73 @@ def ask(t: Tool, args: dict) -> bool:
     return input("  Allow? [y/N] ").strip().lower() in ("y", "yes")
 
 
+CONFIRM_TIMEOUT_SEC = 60
+
+
+def ask_dialog(t: Tool, args: dict) -> bool:
+    """Confirmation as a window instead of a terminal prompt.
+
+    `ask` blocks on stdin, which works in the REPL and nowhere else. Started
+    at login there is no terminal attached, so a CONFIRM tool would block
+    forever on input that can never arrive -- wedging the voice loop and
+    taking the confirmation gate down with it. A gate that hangs is a gate
+    that gets removed.
+
+    Fails closed in every direction. Closing the window, Escape, the timeout
+    and Tk failing to open at all are each a no; the only yes is a click on
+    Allow. There is deliberately no keyboard default -- Enter on a dialog you
+    did not read should not be able to send an email.
+
+    Tk is not thread-safe, so this must run on the main thread. It does: the
+    voice loop drives the agent from main(), and the audio callback never
+    reaches the gate.
+    """
+    import tkinter as tk
+
+    try:
+        root = tk.Tk()
+    except Exception:
+        # No display, no Tk. Refusing is the only safe answer -- falling back
+        # to input() would reintroduce the exact hang this exists to avoid.
+        return False
+
+    allowed = False
+
+    def allow():
+        nonlocal allowed
+        allowed = True
+        root.destroy()
+
+    root.title("MyndOS needs confirmation")
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+    root.protocol("WM_DELETE_WINDOW", root.destroy)  # the X is a no
+    root.bind("<Escape>", lambda _: root.destroy())
+
+    detail = "\n".join(f"{k} = {v!r}" for k, v in args.items()) or "(no arguments)"
+    tk.Label(
+        root, text=t.description, wraplength=440, justify="left",
+        font=("", 10, "bold"),
+    ).pack(padx=16, pady=(16, 6), anchor="w")
+    tk.Label(
+        root, text=f"{t.name}\n{detail}", wraplength=440, justify="left", fg="#555",
+    ).pack(padx=16, pady=(0, 14), anchor="w")
+
+    row = tk.Frame(root)
+    row.pack(padx=16, pady=(0, 16), anchor="e")
+    tk.Button(row, text="Deny", width=10, command=root.destroy).pack(side="right")
+    tk.Button(row, text="Allow", width=10, command=allow).pack(side="right", padx=8)
+
+    # Unanswered is a no. Without this, a dialog raised while he is away wedges
+    # the loop as thoroughly as the stdin prompt did -- just visibly.
+    root.after(int(CONFIRM_TIMEOUT_SEC * 1000), root.destroy)
+
+    root.lift()
+    root.focus_force()
+    root.mainloop()
+    return allowed
+
+
 def execute(
     name: str,
     args: dict | None = None,
