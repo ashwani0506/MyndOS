@@ -3,12 +3,14 @@ import numpy as np
 import json
 import queue
 import sys
+import time
 
 from vosk import Model, KaldiRecognizer
 from rolling_buffer import RollingBuffer
 from transcriber import Transcriber
 from tts import tts
 import brain
+import measure
 import tools
 import vad
 from agent import Agent
@@ -22,6 +24,29 @@ ROLLING_DURATION_SEC = 10      # store last N seconds of audio
 PRE_ROLL_SEC = 3               # how much of the buffer reaches Whisper
 
 WAKE_WORD = "jarvis"
+
+
+class Stopwatch:
+    """Wall clock for one voice turn, split into named stages.
+
+    `lap` closes the stage that was running and starts the next, so the stages
+    tile the turn exactly rather than being seven independent timers with gaps
+    between them that nothing accounts for. Milliseconds, ints: a sub-ms
+    difference in a turn that takes seconds is noise, and formatting floats
+    in a report costs more than it tells anyone.
+    """
+
+    def __init__(self):
+        self.t0 = self.mark = time.perf_counter()
+        self.stages: dict[str, int] = {}
+
+    def lap(self, name: str) -> None:
+        now = time.perf_counter()
+        self.stages[name] = round((now - self.mark) * 1000)
+        self.mark = now
+
+    def total(self) -> int:
+        return round((time.perf_counter() - self.t0) * 1000)
 
 
 def confirm_aloud(t, args) -> bool:
@@ -110,9 +135,11 @@ def main():
                 text = result_json.get("text", "").lower()
                 if WAKE_WORD in text:
                     print(f"[wakeword] Detected wake word: {WAKE_WORD}")
+                    clock = Stopwatch()
 
                     # Stop mic so TTS doesn't leak into audio
                     stop_stream()
+                    clock.lap("teardown")
 
                     # Measured before the acknowledgement, off the whole
                     # buffer: ten seconds of the actual room is a better
@@ -120,11 +147,15 @@ def main():
                     level = vad.threshold(
                         vad.noise_floor(buffer.get_audio(), SAMPLERATE)
                     )
+                    clock.lap("calibrate")
 
                     tts.speak("Yes, sir")
+                    clock.lap("ack")
 
                     command = record_command(level)
-                    print(f"[vad] recorded {len(command) / (SAMPLERATE * 2):.1f}s")
+                    clock.lap("capture")
+                    heard = len(command) / (SAMPLERATE * 2)
+                    print(f"[vad] recorded {heard:.1f}s")
 
                     # Pre-roll, because Vosk only fires once an utterance ends
                     # -- "what time is it, jarvis" is already spoken by then.
@@ -133,12 +164,37 @@ def main():
 
                     # Transcribe
                     transcription = transcriber.transcribe_bytes(audio_to_transcribe)
+                    clock.lap("transcribe")
                     print(f"[main] User said: {transcription}")
 
                     if transcription.strip():
-                        tts.speak(reply(agent, transcription))
+                        answer = reply(agent, transcription)
+                        clock.lap("action")
+                        tts.speak(answer)
                     else:
+                        clock.lap("action")
                         tts.speak("I didn't catch that.")
+                    clock.lap("speak")
+
+                    # Last thing in the turn, and wrapped: a broken log must
+                    # cost the measurement, never the assistant. Everything
+                    # above has already happened by now -- he has his answer.
+                    try:
+                        measure.log(
+                            {
+                                "stages": clock.stages,
+                                "total_ms": clock.total(),
+                                # The part of the turn he spent talking. Without
+                                # it the headline can't separate "slow machine"
+                                # from "long question", which is the one thing
+                                # the stage table cannot show.
+                                "heard_ms": round(heard * 1000),
+                                "transcript": transcription.strip()[:200],
+                            }
+                        )
+                    except Exception as e:
+                        print(f"[main] voice log failed: {type(e).__name__}: {e}",
+                              file=sys.stderr)
 
                     # Clear rolling buffer
                     buffer.clear()

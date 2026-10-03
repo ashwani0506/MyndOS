@@ -1,4 +1,5 @@
-"""Reads logs/brain.jsonl back and says whether the router actually pays off.
+"""Reads the logs back and says whether the router -- and now the voice loop --
+actually pay off.
 
 The router was built on an argument -- classifying cheaply beats paying deep
 latency on every lookup. An argument isn't a number, and the log already has
@@ -10,6 +11,17 @@ and how often each is chosen. What it cannot: whether a routing decision was
 `deep` turns is observational, not a controlled comparison -- the report says
 so rather than quietly presenting it as an experiment.
 
+Two logs, read separately and never mixed:
+
+  brain.jsonl  model calls and routing decisions -- this file's original job.
+  voice.jsonl  the stages the model calls sit inside: ack, record window,
+               transcription, speech. Written by main.py.
+
+They are kept apart on purpose. A voice stage is not a model call, and giving
+it a fake `tier` to squeeze it into the tables below would bend every
+percentile in this report around data that isn't a model call. The two meet
+only in the voice report's headline, where a whole turn is the sum of both.
+
 ponytail: one pass, whole file in memory. A year of heavy use is a few MB, so
 the day that stops being fine is a long way off; stream it then.
 
@@ -17,9 +29,26 @@ Run: python measure.py
 """
 
 import json
+import time
 from collections import Counter
+from pathlib import Path
 
 import brain
+
+HERE = Path(__file__).parent
+VOICE_LOG = HERE / "logs" / "voice.jsonl"
+
+# Fixed order, so the report reads top-to-bottom in the order the turn happens
+# rather than in whatever order the log happens to hold.
+VOICE_STAGES = (
+    "teardown",   # closing the Vosk stream
+    "calibrate",  # noise floor off the rolling buffer
+    "ack",        # "Yes, sir" -- guessed at before this existed
+    "capture",    # mic open until the VAD ends it
+    "transcribe", # Whisper
+    "action",     # the agent: routing, model, tools (brain.jsonl has the detail)
+    "speak",      # TTS of the reply
+)
 
 
 def load(path=None) -> tuple[list[dict], int]:
@@ -41,6 +70,15 @@ def load(path=None) -> tuple[list[dict], int]:
         except ValueError:
             bad += 1
     return records, bad
+
+
+def log(record: dict) -> None:
+    """Append one turn's voice timings. Same shape as brain._log, same reason:
+    appending has to be independent of anyone remembering to read it back."""
+    VOICE_LOG.parent.mkdir(exist_ok=True)
+    record["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    with VOICE_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=str) + "\n")
 
 
 def _pct(xs: list[int], p: int) -> int | None:
@@ -139,5 +177,121 @@ def report(records: list[dict], bad: int = 0) -> str:
     return "\n".join(out)
 
 
+def _stage(turns: list[dict], name: str) -> list[int]:
+    """Every turn's value for one stage. `stages` is a dict per turn, so a turn
+    that predates a stage simply has no entry and contributes a missing sample
+    rather than a wrong one."""
+    return [r["stages"][name] for r in turns if name in r.get("stages", {})]
+
+
+def _drop_warmup(records: list[dict], gap_ms: int = 30_000, least: int = 2) -> tuple[list[dict], int]:
+    """Drop the first turn of each burst, and count them.
+
+    A burst is turns less than 30s apart -- that's one sitting, and it is the
+    *first* turn of it that pays for Whisper loading into memory and pyttsx3
+    waking its device. Every turn after that is the warm machine, which is the
+    one worth measuring. Excluding the first of each burst removes the cold
+    outlier and keeps everything else, which is the opposite of dropping turns
+    for being close together.
+
+    A line with an unparseable timestamp can't be placed on the clock, so it is
+    kept and treated as starting fresh -- the next turn is measured against
+    nothing rather than against a moment that never existed.
+
+    Refuses when it would leave fewer than `least` turns. A log with three
+    commands spread across a day is three bursts of one turn each, and cutting
+    that to one sample would trade a real measurement for a clean one. When it
+    declines, the count says so and nothing is hidden.
+
+    ponytail: a gap is a guess at "was this cold", not a measurement of it.
+    Log a `cold` flag from the loop if warm/cold ever needs to be exact.
+    """
+    kept, prev_t = [], None
+    for r in records:
+        try:
+            t = time.mktime(time.strptime(r["ts"], "%Y-%m-%dT%H:%M:%S"))
+        except (KeyError, ValueError):
+            kept.append(r)  # unreadable timestamp is not grounds for exclusion
+            prev_t = None   # nor is it a moment the next turn can be timed from
+            continue
+        if prev_t is None or (t - prev_t) * 1000 >= gap_ms:
+            prev_t = t  # first of a burst, and therefore the cold one
+            continue
+        prev_t = t
+        kept.append(r)
+
+    cold = len(records) - len(kept)
+    if len(kept) < least:
+        return records, 0  # too little left to be a measurement; keep it all
+    return kept, cold
+
+
+def voice_report(records: list[dict], bad: int = 0) -> str:
+    """The voice loop's half: where a spoken turn's wall clock actually goes.
+
+    The router report answers "is this faster than always using the deep tier".
+    This answers the question the VAD commit argued in prose: how much of the
+    wait is the machine, and how much is the hang it sits through after I stop
+    talking. Same standard -- an argument isn't a number.
+    """
+    turns, warmup = _drop_warmup(records)
+    if not turns:
+        return (
+            "No voice turns logged yet. Talk to it first: python main.py\n"
+            "(Nothing appears here until the loop has run once with a wake word.)"
+        )
+
+    out = [
+        f"{len(turns)} voice turns"
+        + (f", {bad} unreadable lines" if bad else "")
+        + (f", {warmup} first-turn outliers excluded" if warmup else "")
+    ]
+
+    out.append(f"\nStage (ms){'p50':>11}{'p95':>8}{'n':>7}")
+    for stage in VOICE_STAGES:
+        out.append(_row(stage, _stage(turns, stage)))
+
+    # The headline. A stage table answers "which part is slow"; this answers
+    # "how long after I stopped talking did it answer", which is the question
+    # the person waiting actually has. Sum-of-stages would be the same number
+    # minus whatever went unmeasured, and quietly reading low.
+    heard = [r["heard_ms"] for r in turns if "heard_ms" in r]
+    if heard and len(heard) == len(turns):
+        quiet = [r["total_ms"] - r["heard_ms"] for r in turns]
+        t50 = _pct([r["total_ms"] for r in turns], 50)
+        p50, p95 = _pct(quiet, 50), _pct(quiet, 95)
+        out.append("\nAfter he stops talking")
+        out.append(f"  {'to a spoken reply':<16}{p50:>7}{p95:>8}{len(quiet):>7}")
+        if t50:
+            out.append(
+                f"\n  The {p50}ms above is silence spent waiting on the machine,\n"
+                f"  not on him speaking -- {round(100 * p50 / t50)}% of a "
+                f"{t50}ms turn. The rest is him talking."
+            )
+    else:
+        out.append(
+            "\n  No heard_ms on some turns, so the silent gap can't be computed.\n"
+            "  (Older lines, logged before the split existed.)"
+        )
+
+    # Counted whenever the field is present, not only when something was heard.
+    # A log where every turn came back empty is the one worth seeing, and it is
+    # exactly the case a `if any words` guard would hide.
+    logged = [r for r in turns if "transcript" in r]
+    if logged:
+        words = [r for r in logged if r["transcript"].strip()]
+        empty = len(logged) - len(words)
+        line = f"\n  {len(words)} of {len(logged)} turns produced words"
+        if empty:
+            line += f", {empty} heard nothing recognisable"
+        if not words:
+            line += "\n  Nothing was transcribed at all -- check the mic and the\n" \
+                    "  VAD threshold before reading anything else here."
+        out.append(line)
+    return "\n".join(out)
+
+
 if __name__ == "__main__":
     print(report(*load()))
+    print()
+    print(voice_report(*load(VOICE_LOG)))

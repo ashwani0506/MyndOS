@@ -130,6 +130,7 @@ def main():
             import measure  # local: the loop doesn't need it until asked
 
             print(f"\n{measure.report(*measure.load())}\n")
+            print(f"{measure.voice_report(*measure.load(measure.VOICE_LOG))}\n")
             continue
 
         tier = None  # None means let the router pick
