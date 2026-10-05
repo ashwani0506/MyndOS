@@ -67,8 +67,8 @@ def capture(
     hang: float = HANG_SEC,
     lead_in: float = LEAD_IN_SEC,
     max_sec: float = MAX_SEC,
-) -> bytes:
-    """Collect frames until he stops talking. Returns the audio.
+) -> tuple[bytes, float]:
+    """Collect frames until he stops talking. Returns (audio, seconds spoken).
 
     `read_frame` is a callable returning one FRAME_MS frame of int16 PCM --
     injected rather than opening a stream here, so the whole decision can be
@@ -77,9 +77,19 @@ def capture(
     Three ways out, and the order matters: silence after speech (the normal
     one), nothing said at all within `lead_in`, and the hard `max_sec` cap.
     Without the second, a misfired wake word costs fifteen seconds of staring.
+
+    The second return value is first speech frame to last, which is not the
+    length of the audio: that also holds the gap before he started and the
+    `hang` of quiet at the end. Both of those are silence he waited through, so
+    counting them as speech would file his dead time on the wrong side of the
+    ledger -- and the measurement they feed exists to separate exactly those
+    two. A pause mid-sentence does count as speaking, because it is.
     """
     frame_sec = FRAME_MS / 1000
-    frames, heard_speech, quiet, elapsed = [], False, 0.0, 0.0
+    frames, quiet, elapsed = [], 0.0, 0.0
+    # Also serves as "has he said anything yet", which is why there's no
+    # separate flag: two variables holding one fact is one of them going stale.
+    first = last = None
 
     while elapsed < max_sec:
         frame = read_frame()
@@ -87,16 +97,19 @@ def capture(
         elapsed += frame_sec
 
         if rms(frame) > level:
-            heard_speech, quiet = True, 0.0
+            if first is None:
+                first = elapsed - frame_sec  # the start of this frame
+            last = elapsed
+            quiet = 0.0
             continue
 
         quiet += frame_sec
         # Only the run of quiet *after* speech ends it. A pause for breath
         # mid-sentence is shorter than HANG_SEC, which is the whole reason
         # that constant isn't smaller.
-        if heard_speech and quiet >= hang:
+        if first is not None and quiet >= hang:
             break
-        if not heard_speech and elapsed >= lead_in:
+        if first is None and elapsed >= lead_in:
             break
 
-    return b"".join(frames)
+    return b"".join(frames), (last - first if first is not None else 0.0)

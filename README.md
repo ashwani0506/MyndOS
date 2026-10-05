@@ -155,6 +155,50 @@ ponytail: RMS can't tell speech from a slammed door, so a loud noise can hold
 the capture open to its ceiling. Fine for a desk mic in a room with one person;
 `webrtcvad` classifies frames of the same size if that stops being true.
 
+### Where a spoken turn's time actually goes
+
+Everything above is an argument. `measure.voice_report()` is the number, read
+back from a second log the voice loop writes per turn — seven stages, p50/p95,
+plus a headline. The shape, with the figures left out because the ones from my
+machine aren't yours:
+
+```
+Stage (ms)        p50     p95      n
+  teardown        ...     ...     ...
+  calibrate       ...
+  ack             ...        <- the spoken "Yes, sir"
+  capture         ...        <- mic open, him talking
+  transcribe      ...        <- Whisper
+  action          ...        <- the agent; brain.jsonl has the breakdown
+  speak           ...        <- TTS of the reply
+```
+
+Four decisions shape it, and each one is a way the report could have lied:
+
+- **A separate log from `brain.jsonl`.** A voice stage is not a model call.
+  Giving it a `tier` field to fit the router's tables would have bent every
+  percentile there around data that isn't a model call.
+- **The stages tile the turn.** `lap` closes one as it opens the next, so the
+  seven rows add up to the total and unmeasured time has nowhere to hide.
+- **The first turn of each sitting is excluded**, and the report says so.
+  Whisper loading and pyttsx3 waking its device are paid once and never again;
+  left in, that single turn *is* the p95 and describes a machine nobody uses.
+  Below two surviving turns it declines to filter at all and says that instead
+  — three commands across a day is three sittings of one, and trading a real
+  measurement for a clean one is the wrong trade here.
+- **A stage with no entry is a missing sample, not a zero.** Scoring `0ms` for
+  a stage that a log line predates would halve its median and retire a problem
+  that hadn't been fixed.
+
+The headline isn't in the table, because the table answers *which stage is
+slow* and the person standing there is asking something else: **how long after
+I stopped talking did it answer.** That needs to know how long he talked, which
+is why `capture()` returns first speech frame to last rather than the length of
+the recording. The recording also holds the gap before he started and the 0.7s
+hang at the end, and both of those are silence he sat through. Filing them as
+speech would have shortened the reported wait by about a second — in the
+flattering direction, in the one number the whole measurement exists to produce.
+
 ---
 
 ## Security model

@@ -133,11 +133,11 @@ def test_not_enough_data_refuses_to_give_a_verdict():
 # --------------------------------------------------------------------------
 
 
-def _turn(total, heard=1000, at="2026-10-02T12:00:00", transcript=None, **stages):
+def _turn(total, spoke=1000, at="2026-10-02T12:00:00", transcript=None, **stages):
     """One voice.jsonl line. `transcript` is named explicitly because it lives
     beside `stages` rather than inside it -- passing it via **stages would put
     a string where the stage table expects milliseconds."""
-    r = {"stages": stages, "total_ms": total, "heard_ms": heard, "ts": at}
+    r = {"stages": stages, "total_ms": total, "spoke_ms": spoke, "ts": at}
     if transcript is not None:
         r["transcript"] = transcript
     return r
@@ -215,9 +215,9 @@ def test_the_headline_separates_waiting_from_talking():
     """The stage table says which part is slow. This says how long he waited in
     silence, which is the question the person standing there actually has."""
     out = _voice(
-        _turn(5000, heard=2000, at="2026-10-02T12:00:00", capture=2700),
-        _turn(5000, heard=2000, at="2026-10-02T12:00:10", capture=2700),
-        _turn(5000, heard=2000, at="2026-10-02T12:00:20", capture=2700),
+        _turn(5000, spoke=2000, at="2026-10-02T12:00:00", capture=2700),
+        _turn(5000, spoke=2000, at="2026-10-02T12:00:10", capture=2700),
+        _turn(5000, spoke=2000, at="2026-10-02T12:00:20", capture=2700),
     )
     assert _n(out, "to a spoken reply") == "2", "the burst leader is excluded"
     # 5000 total - 2000 spoken = 3000 of silence, 60% of the turn.
@@ -225,12 +225,12 @@ def test_the_headline_separates_waiting_from_talking():
     assert "60% of a 5000ms turn" in out
 
 
-def test_an_older_line_without_heard_ms_suppresses_the_headline():
+def test_an_older_line_without_a_spoken_time_suppresses_the_headline():
     """Computing it from the turns that do have it would report a number from a
     subset while labelling it as all of them."""
     out = _voice(
-        _turn(5000, heard=2000, at="2026-10-02T12:00:00", capture=1000),
-        _turn(5000, heard=2000, at="2026-10-02T12:00:10", capture=1000),
+        _turn(5000, spoke=2000, at="2026-10-02T12:00:00", capture=1000),
+        _turn(5000, spoke=2000, at="2026-10-02T12:00:10", capture=1000),
         {"stages": {"capture": 1000}, "total_ms": 5000, "ts": "2026-10-02T12:00:20"},
     )
     assert "can't be computed" in out

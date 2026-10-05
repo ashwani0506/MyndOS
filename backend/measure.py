@@ -255,9 +255,9 @@ def voice_report(records: list[dict], bad: int = 0) -> str:
     # "how long after I stopped talking did it answer", which is the question
     # the person waiting actually has. Sum-of-stages would be the same number
     # minus whatever went unmeasured, and quietly reading low.
-    heard = [r["heard_ms"] for r in turns if "heard_ms" in r]
-    if heard and len(heard) == len(turns):
-        quiet = [r["total_ms"] - r["heard_ms"] for r in turns]
+    spoke = [r["spoke_ms"] for r in turns if "spoke_ms" in r]
+    if spoke and len(spoke) == len(turns):
+        quiet = [r["total_ms"] - r["spoke_ms"] for r in turns]
         t50 = _pct([r["total_ms"] for r in turns], 50)
         p50, p95 = _pct(quiet, 50), _pct(quiet, 95)
         out.append("\nAfter he stops talking")
@@ -270,7 +270,7 @@ def voice_report(records: list[dict], bad: int = 0) -> str:
             )
     else:
         out.append(
-            "\n  No heard_ms on some turns, so the silent gap can't be computed.\n"
+            "\n  No spoke_ms on some turns, so the silent gap can't be computed.\n"
             "  (Older lines, logged before the split existed.)"
         )
 

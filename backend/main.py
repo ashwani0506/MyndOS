@@ -144,18 +144,26 @@ def main():
                     # Measured before the acknowledgement, off the whole
                     # buffer: ten seconds of the actual room is a better
                     # sample of it than anything measurable after.
-                    level = vad.threshold(
-                        vad.noise_floor(buffer.get_audio(), SAMPLERATE)
-                    )
+                    floor = vad.noise_floor(buffer.get_audio(), SAMPLERATE)
+                    level = vad.threshold(floor)
                     clock.lap("calibrate")
+                    # Printed because "it didn't hear me" and "it never stopped
+                    # recording" are one symptom from the outside and opposite
+                    # numbers here. "(floor)" means the room measured quieter
+                    # than MIN_RMS, so the threshold is the hard minimum rather
+                    # than anything this room told us.
+                    print(
+                        f"[vad] room {floor:.0f}, speech above {level:.0f}"
+                        + (" (floor)" if level == vad.MIN_RMS else "")
+                    )
 
                     tts.speak("Yes, sir")
                     clock.lap("ack")
 
-                    command = record_command(level)
+                    command, spoke = record_command(level)
                     clock.lap("capture")
-                    heard = len(command) / (SAMPLERATE * 2)
-                    print(f"[vad] recorded {heard:.1f}s")
+                    recorded = len(command) / (SAMPLERATE * 2)
+                    print(f"[vad] recorded {recorded:.1f}s, {spoke:.1f}s of speech")
 
                     # Pre-roll, because Vosk only fires once an utterance ends
                     # -- "what time is it, jarvis" is already spoken by then.
@@ -184,11 +192,15 @@ def main():
                             {
                                 "stages": clock.stages,
                                 "total_ms": clock.total(),
-                                # The part of the turn he spent talking. Without
-                                # it the headline can't separate "slow machine"
-                                # from "long question", which is the one thing
-                                # the stage table cannot show.
-                                "heard_ms": round(heard * 1000),
+                                # First word to last -- not the length of the
+                                # recording, which also holds the gap before he
+                                # started and the hang at the end. Both of those
+                                # are silence he waited through, and counting
+                                # them here shortened the reported wait by about
+                                # a second, in the flattering direction. Named
+                                # for what it is, because "heard" read as
+                                # "recorded" once already and cost exactly that.
+                                "spoke_ms": round(spoke * 1000),
                                 "transcript": transcription.strip()[:200],
                             }
                         )
@@ -209,7 +221,7 @@ def main():
 
 
 def record_command(level):
-    """Record until he stops talking, rather than for a fixed three seconds.
+    """Record until he stops talking. Returns (audio, seconds he spoke).
 
     A dedicated int16 stream, read a frame at a time: the resident stream is
     float32 with half-second blocks for Vosk's benefit, and neither suits a

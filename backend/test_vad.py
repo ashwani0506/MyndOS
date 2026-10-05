@@ -33,8 +33,10 @@ def _mic(pattern: str):
     return lambda: _pcm(LOUD if next(it, ".") == "!" else 0)
 
 
-def _frames(audio: bytes) -> int:
-    return len(audio) // (FRAME * 2)
+def _cap(pattern: str):
+    """Run a scripted capture. Returns (frames recorded, seconds spoken)."""
+    audio, spoke = vad.capture(_mic(pattern), LEVEL, **SHORT)
+    return len(audio) // (FRAME * 2), round(spoke, 3)
 
 
 def test_rms_reads_loudness():
@@ -72,36 +74,56 @@ def test_a_silent_room_still_gets_a_usable_threshold():
 
 
 def test_capture_ends_after_a_run_of_quiet():
-    audio = vad.capture(_mic("..!!!!"), LEVEL, **SHORT)
-    assert _frames(audio) == 9  # 2 lead-in + 4 speech + 3 hang
+    frames, spoke = _cap("..!!!!")
+    assert frames == 9  # 2 lead-in + 4 speech + 3 hang
+    assert spoke == 0.12, "4 speech frames, and neither silence counted"
 
 
 def test_a_pause_for_breath_does_not_end_the_capture():
     """The one that decides whether this is usable. A two-frame pause inside a
     sentence is shorter than hang, so the second half must survive -- stopping
     at the pause would have returned 5 frames and lost the rest."""
-    audio = vad.capture(_mic("!!..!!!"), LEVEL, **SHORT)
-    assert _frames(audio) == 10, "cut off at a mid-sentence pause"
+    frames, spoke = _cap("!!..!!!")
+    assert frames == 10, "cut off at a mid-sentence pause"
+    # First speech frame to last, pause included: he was mid-sentence, not
+    # waiting on the machine, so that pause belongs to him.
+    assert spoke == 0.21
 
 
 def test_a_misfired_wake_word_gives_up_quickly():
     """Nothing said at all. Without this the capture would sit there for the
     full max_sec, which is the fixed-window problem with extra steps."""
-    audio = vad.capture(_mic(""), LEVEL, **SHORT)
-    assert _frames(audio) == 5  # lead_in, not max_sec
+    frames, spoke = _cap("")
+    assert frames == 5  # lead_in, not max_sec
+    assert spoke == 0.0, "silence must not read as speech"
 
 
 def test_lead_in_is_the_deadline_for_starting_to_speak():
     """Speech that starts after lead_in is missed -- so LEAD_IN_SEC has to be
     longer than the gap between the spoken acknowledgement ending and him
     starting. 2s in production; this pins the boundary, it doesn't excuse it."""
-    audio = vad.capture(_mic(".....!!!"), LEVEL, **SHORT)
-    assert _frames(audio) == 5, "gave up before the late start, as designed"
+    frames, spoke = _cap(".....!!!")
+    assert frames == 5, "gave up before the late start, as designed"
+    assert spoke == 0.0
 
 
 def test_someone_who_will_not_stop_talking_is_capped():
-    audio = vad.capture(_mic("!" * 50), LEVEL, **SHORT)
-    assert _frames(audio) == 20  # max_sec 0.6 / 0.03
+    frames, spoke = _cap("!" * 50)
+    assert frames == 20  # max_sec 0.6 / 0.03
+    assert spoke == 0.6, "no hang to subtract -- it hit the cap mid-sentence"
+
+
+def test_the_silence_he_sat_through_is_not_counted_as_talking():
+    """The headline in measure.py is total minus spoken, so anything misfiled
+    as speech here shortens the reported wait -- in the flattering direction.
+
+    Two silences bracket every command: the gap before he starts, and the hang
+    the VAD deliberately waits out to be sure he's done. Both are time he spent
+    staring at the machine.
+    """
+    frames, spoke = _cap("..!!!!")
+    assert frames == 9                       # 0.27s of audio
+    assert round(frames * 0.03 - spoke, 3) == 0.15  # 2 frames before, 3 after
 
 
 if __name__ == "__main__":
