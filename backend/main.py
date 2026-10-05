@@ -144,10 +144,18 @@ def main():
                     # Measured before the acknowledgement, off the whole
                     # buffer: ten seconds of the actual room is a better
                     # sample of it than anything measurable after.
-                    level = vad.threshold(
-                        vad.noise_floor(buffer.get_audio(), SAMPLERATE)
-                    )
+                    floor = vad.noise_floor(buffer.get_audio(), SAMPLERATE)
+                    level = vad.threshold(floor)
                     clock.lap("calibrate")
+                    # Printed because "it didn't hear me" and "it never stopped
+                    # recording" are one symptom from the outside and opposite
+                    # numbers here. "(floor)" means the room measured quieter
+                    # than MIN_RMS, so the threshold is the hard minimum rather
+                    # than anything this room told us.
+                    print(
+                        f"[vad] room {floor:.0f}, speech above {level:.0f}"
+                        + (" (floor)" if level == vad.MIN_RMS else "")
+                    )
 
                     tts.speak("Yes, sir")
                     clock.lap("ack")
