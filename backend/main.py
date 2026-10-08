@@ -25,6 +25,17 @@ PRE_ROLL_SEC = 3               # how much of the buffer reaches Whisper
 
 WAKE_WORD = "jarvis"
 
+# The lines it says back verbatim, held as constants because tts.py caches by
+# exact text: pre-rendering "Yes, sir" and then speaking "Yes sir" is a cache
+# that never hits and nothing that ever says so. Anything interpolated is
+# deliberately absent -- a phrase with a tool name in it is a different string
+# every time and could never be rendered ahead.
+ACK = "Yes, sir"
+NOT_HEARD = "I didn't catch that."
+NO_MODEL = "I can't reach a model right now."
+NOTHING_TO_SAY = "I've got nothing useful to say to that."
+SCRIPTED = (ACK, NOT_HEARD, NO_MODEL, NOTHING_TO_SAY)
+
 
 class Stopwatch:
     """Wall clock for one voice turn, split into named stages.
@@ -68,10 +79,10 @@ def reply(agent: Agent, transcription: str) -> str:
     reasoning latency.
     """
     try:
-        return agent.say(transcription) or "I've got nothing useful to say to that."
+        return agent.say(transcription) or NOTHING_TO_SAY
     except brain.NoProviderAvailable as e:
         print(f"[main] {e}", file=sys.stderr)
-        return "I can't reach a model right now."
+        return NO_MODEL
     except Exception as e:
         print(f"[main] {type(e).__name__}: {e}", file=sys.stderr)
         return f"Something broke: {type(e).__name__}. It's in the terminal."
@@ -81,6 +92,10 @@ def main():
     print("[main] Loading Vosk model...")
     model = Model(lang="en-us")
     rec = KaldiRecognizer(model, SAMPLERATE)
+
+    # Before the first wake word, so the acknowledgement is never the thing
+    # being rendered while he waits for it.
+    tts.warm(*SCRIPTED)
 
     buffer = RollingBuffer(max_duration=ROLLING_DURATION_SEC, samplerate=SAMPLERATE)
     transcriber = Transcriber()
@@ -157,7 +172,7 @@ def main():
                         + (" (floor)" if level == vad.MIN_RMS else "")
                     )
 
-                    tts.speak("Yes, sir")
+                    tts.speak(ACK)
                     clock.lap("ack")
 
                     command, spoke = record_command(level)
@@ -181,7 +196,7 @@ def main():
                         tts.speak(answer)
                     else:
                         clock.lap("action")
-                        tts.speak("I didn't catch that.")
+                        tts.speak(NOT_HEARD)
                     clock.lap("speak")
 
                     # Last thing in the turn, and wrapped: a broken log must
