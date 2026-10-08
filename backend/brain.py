@@ -26,6 +26,7 @@ import re
 import socket
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -35,10 +36,13 @@ from openai import OpenAI
 HERE = Path(__file__).parent
 LOG_PATH = HERE / "logs" / "brain.jsonl"
 COOLDOWN_SEC = 600
+# A local failure is not a cloud failure. See Provider.cooldown.
+LOCAL_COOLDOWN_SEC = 30
 
 # Repo root, explicitly. A bare load_dotenv() walks up the directory tree and
 # would pick up an unrelated project's .env from a parent folder.
-load_dotenv(HERE.parent / ".env")
+ENV_PATH = HERE.parent / ".env"
+load_dotenv(ENV_PATH)
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,32 @@ class Provider:
     fast: str | None = None
     deep: str | None = None
     window: tuple[str, str] | None = None  # local-time range this key actually serves
+    # Seconds to wait on one call. Generous for a local model, which has to
+    # read itself off disk into VRAM on the first call of a session -- a slow
+    # path, not a failure. A warm cloud endpoint that hasn't answered in 30s
+    # isn't going to.
+    timeout: float = 30.0
+    # Sent on fast-tier calls only: thinking is the point of the deep tier and
+    # pure latency on a reflexive one. "none" switches a reasoning model's
+    # monologue off.
+    #
+    # This is the standard OpenAI parameter, not a vendor hack, which is why it
+    # can live on the one client shape every provider shares. Three things that
+    # look like they should do this and do not, on ollama 0.35 + qwen3:1.7b:
+    # a literal "/no_think" in the prompt (the chat template stopped reading
+    # it), `think: false` through /v1 (the compat layer drops it; it works only
+    # on the native /api/chat), and `chat_template_kwargs`. Each returned 249
+    # characters of reasoning and an empty `content`.
+    reasoning_effort: str | None = None
+    # Ollama only: how long to keep the model in VRAM, -1 being "never unload".
+    # Sent in the request body rather than relied on from OLLAMA_KEEP_ALIVE,
+    # because the env var has to be set for whichever process launched the
+    # server -- on Windows the desktop app auto-starts, so a `setx` after that
+    # does nothing until a reboot, and a fresh clone inherits none of it. The
+    # latency decision belongs next to the latency, not in a shell profile.
+    #
+    # Measured here: cold 154,630ms, warm 431ms. Same model, same prompt.
+    keep_alive: int | None = None
 
     def model_for(self, tier: str) -> str | None:
         return self.fast if tier == "fast" else self.deep
@@ -56,6 +86,24 @@ class Provider:
     @property
     def local(self) -> bool:
         return self.base_url.startswith("http://localhost")
+
+    @property
+    def cooldown(self) -> float:
+        """How long to bench this provider after a failure.
+
+        A cloud failure is quota or auth. It persists, and each retry burns a
+        real request, so ten minutes is right. A local failure is one of two
+        other things: not running, which costs under a millisecond to retest,
+        or still loading the model, which will succeed shortly. Ten minutes is
+        wrong for both.
+
+        It is worse than wrong when local is the only provider configured --
+        which is the state of a fresh clone with no keys, and was the state
+        this was found in. There, benching ollama once means ten minutes of no
+        assistant at all, triggered by a cold model load that was going to
+        finish in twenty seconds.
+        """
+        return LOCAL_COOLDOWN_SEC if self.local else COOLDOWN_SEC
 
     def api_key(self) -> str | None:
         # Local servers need no key but the OpenAI SDK insists on a non-empty one.
@@ -100,8 +148,21 @@ PROVIDERS = {
             "ollama",
             "http://localhost:11434/v1",
             "OLLAMA_API_KEY",
-            fast="qwen3:4b",
-            deep="qwen3:4b",
+            fast="qwen3:1.7b",
+            deep="qwen3:1.7b",
+            # A cold model coming off disk into VRAM is slow once per load --
+            # measured at 70s here, on a 4GB card. ponytail: a flat ceiling,
+            # not a cold/warm distinction -- a genuinely stuck local server now
+            # costs two minutes instead of thirty seconds. Worth it while local
+            # is the only offline floor; split it if a warm call ever
+            # legitimately needs this long.
+            #
+            # The ceiling is not the fix for the cold load, only the thing that
+            # stops it being recorded as a failure. The fix is keeping the model
+            # resident: see OLLAMA_KEEP_ALIVE in the README.
+            timeout=120.0,
+            reasoning_effort="none",
+            keep_alive=-1,
         ),
         Provider(
             "groq",
@@ -123,15 +184,15 @@ PROVIDERS = {
             "OPENROUTER_API_KEY",
             deep="deepseek/deepseek-chat-v3.1:free",
         ),
-        # Third-party reseller key: serves a known 2-hour window, so the clock
-        # skips it outright for the other 22 and the cooldown handles the pool
-        # draining early inside it. Flip to ("04:30","06:30") if it's mornings.
+        # Anthropic direct. No `window`: that belonged to a third-party reseller
+        # key that served a fixed two-hour slot, and keeping its schedule on a
+        # real key would skip Claude for 22 hours a day for no reason. The
+        # mechanism stays (see _in_window) -- it just has no user right now.
         Provider(
             "claude",
             os.getenv("CLAUDE_BASE_URL", "https://api.anthropic.com/v1/"),
             "CLAUDE_API_KEY",
             deep="claude-sonnet-5",
-            window=("16:30", "18:30"),
         ),
     ]
 }
@@ -143,9 +204,67 @@ CHAINS = {
 
 _cooldown: dict[str, float] = {}
 
+# A reasoning block, as qwen3 and friends emit it inline in `content`.
+_THINK = re.compile(r"<think>.*?</think>", re.S)
+# The same thing cut off by max_tokens: an opening tag with no close.
+_THINK_OPEN = re.compile(r"<think>.*$", re.S)
+
+
+def _spoken(text: str) -> str:
+    """The part of a reply meant for a human.
+
+    Belt to `reasoning_effort`'s braces. Ollama 0.35 returns the monologue in a
+    separate `reasoning` field, so nothing inline survives to be stripped here
+    -- but an older ollama, and openrouter's deepseek, put it in `content` with
+    the tags still on. Two regexes is a cheap insurance premium against a model
+    reading its own notes out loud.
+
+    Done here because this is the one point every reply passes through. At the
+    call sites it is one `or ""` away from being forgotten again, and the cost
+    of forgetting is paid out loud.
+
+    The unterminated case is truncation: max_tokens can cut a reply off
+    mid-thought, leaving `<think>` with no close, and the tag-to-end strip is
+    right because whatever followed was never going to be the answer.
+    """
+    return _THINK_OPEN.sub("", _THINK.sub("", text)).strip()
+
+
+def _extra_body(p: Provider, tier: str) -> dict:
+    """Provider-specific request fields. Empty dict for a plain cloud endpoint,
+    which is the point -- `keep_alive` sent to Groq is an unknown field.
+
+    `reasoning_effort` is fast-tier only: a deep turn is exactly when the
+    monologue is worth paying for.
+    """
+    body = {}
+    if p.keep_alive is not None:
+        body["keep_alive"] = p.keep_alive
+    if tier == "fast" and p.reasoning_effort:
+        body["reasoning_effort"] = p.reasoning_effort
+    return body
+
 
 class NoProviderAvailable(RuntimeError):
     pass
+
+
+@lru_cache(maxsize=None)
+def _client(base_url: str, api_key: str, timeout: float) -> OpenAI:
+    """One client per provider, reused for the life of the process.
+
+    Building a fresh `OpenAI()` per call cost 2.2 seconds before the model saw a
+    single token; the same call on a client that already existed took 45ms. The
+    cost is establishing the connection, not constructing the object, so it was
+    paid once per *call* rather than once per provider -- and a voice turn makes
+    two calls, which put four and a half seconds of handshake inside a turn that
+    was being optimised in milliseconds elsewhere.
+
+    Keyed on the key as well as the URL, so rotating a credential builds a new
+    client rather than reusing one authenticated with the old one. Five
+    providers means at most five live clients.
+    """
+    return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
 
 
 def _log(record: dict) -> None:
@@ -195,10 +314,18 @@ def complete(messages: list[dict], tier: str = "deep", purpose: str = "answer", 
     for p in candidates:
         started = time.time()
         try:
-            client = OpenAI(base_url=p.base_url, api_key=p.api_key(), timeout=30.0)
+            client = _client(p.base_url, p.api_key(), p.timeout)
             resp = client.chat.completions.create(
-                model=p.model_for(tier), messages=messages, **kwargs
+                model=p.model_for(tier),
+                messages=messages,
+                **({"extra_body": extra} if (extra := _extra_body(p, tier)) else {}),
+                **kwargs,
             )
+            # Before anything downstream can read it, speak it, or store it in
+            # the conversation history as if the model had said it.
+            msg = resp.choices[0].message
+            if msg.content:
+                msg.content = _spoken(msg.content)
             _log(
                 {
                     "tier": tier,
@@ -212,7 +339,7 @@ def complete(messages: list[dict], tier: str = "deep", purpose: str = "answer", 
             )
             return resp
         except Exception as e:
-            _cooldown[p.name] = time.time() + COOLDOWN_SEC
+            _cooldown[p.name] = time.time() + p.cooldown
             errors.append(f"{p.name}: {type(e).__name__}: {e}")
             _log(
                 {
@@ -252,8 +379,6 @@ would mislead.
 
 Reply with exactly one word: FAST or DEEP. When in doubt, reply DEEP."""
 
-_THINK = re.compile(r"<think>.*?</think>", re.S)
-
 
 def classify(utterance: str, context: str = "") -> str:
     """Pick a tier for one turn: "fast" for reflexive, "deep" for reasoning.
@@ -278,12 +403,13 @@ def classify(utterance: str, context: str = "") -> str:
 
     started = time.time()
     try:
-        # /no_think is Qwen3's switch for skipping its reasoning block, which on
-        # a one-word answer is pure latency. It's also why max_tokens is 32 and
-        # not 2: the template still emits an empty <think></think> pair, and a
-        # reply truncated before the word would fall through to deep every time.
+        # 32 and not 2 for headroom: a reply truncated before the word falls
+        # through to deep every time, which is how this spent a while looking
+        # like a routing decision instead of an empty string. The switch that
+        # makes 32 enough is the provider's `reasoning_effort` -- without it the
+        # budget goes entirely to the monologue and `content` arrives blank.
         answer = think(
-            f"{prompt}\n/no_think",
+            prompt,
             tier="fast",
             system=CLASSIFY_SYSTEM,
             purpose="classify",
@@ -296,7 +422,7 @@ def classify(utterance: str, context: str = "") -> str:
 
     # Last word wins, so "this isn't FAST, it's DEEP" reads correctly. Neither
     # word present leaves both at -1, which is not greater than itself: deep.
-    low = _THINK.sub("", answer).lower()
+    low = answer.lower()
     tier = "fast" if low.rfind("fast") > low.rfind("deep") else "deep"
     _log(
         {
@@ -327,6 +453,19 @@ def status() -> str:
             state = "ready"
         tiers = ",".join(t for t in ("fast", "deep") if p.model_for(t))
         lines.append(f"  {name:<11} [{tiers:<9}] {state}")
+
+    # Five "no key" lines are five symptoms of one cause, and the cause is
+    # almost never five missing keys. Say which file wasn't there, and -- the
+    # one that actually happened -- say when the keys exist a directory below
+    # and are being ignored for it.
+    if not ENV_PATH.exists() and any(not p.api_key() for p in PROVIDERS.values()):
+        lines.append(f"\n  No .env at {ENV_PATH}")
+        stray = HERE / ".env"
+        if stray.exists():
+            lines.append(
+                f"  There is one at {stray},\n"
+                f"  which is not read. Move it up one level."
+            )
 
     # The fast chain starting local is the precondition for routing at all, so
     # when it isn't met, say so here rather than leaving it to be inferred from
