@@ -49,4 +49,7 @@ CLAUDE.md
 backend/.env
 backend/logs/
 backend/memory/
+# Pre-rendered speech. Regenerated on first launch, and machine-specific: the
+# WAVs carry whichever SAPI5 voice this laptop has installed.
+backend/cache/
 .claude/

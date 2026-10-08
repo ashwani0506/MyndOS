@@ -17,12 +17,15 @@ status table below is honest about what is built and what isn't.
 | Model router (`brain.py`) | **Working.** Tiered, multi-provider, cooldown-aware fallback, plus intent routing per turn. |
 | Trusted execution layer (`tools.py`) | **Working.** Risk-tiered registry, confirmation gate, action log. |
 | Tools | Clipboard read, scoped file read, confirmed file write, remember a fact. |
+| No-model handlers (`handlers.py`) | **Working.** Time and date answered from the standard library, with no model call at all. |
+| Speech (`tts.py`) | **Working.** Fixed phrases pre-rendered to WAV and played from disk; an engine per utterance, which is what makes repeated speech work at all. |
+| Transcription confidence gate | **Working.** A capture Whisper isn't confident about is discarded rather than answered. |
 | Persona + user profile | **Working.** Plain markdown, re-read per request. |
 | Text REPL (`agent.py`) | **Working.** Full tool-calling loop. |
-| Voice → agent | **Working.** `main.py` drives the same `Agent` as the REPL, so every voice command goes through the gate and the log. |
+| Voice → agent | **Built, not yet verified end to end.** `main.py` drives the same `Agent` as the REPL, so every voice command goes through the gate and the log — but no complete spoken turn has been recorded yet (`logs/voice.jsonl` is still empty). Promoted to *working* when it has turns in it. |
 | Long-term memory | **Working.** Markdown notes on disk, recalled into the prompt before the model sees the turn. |
 | Measurement (`measure.py`) | **Working.** Reads the brain log back: tier latency, routing split, and whether the router nets out positive. |
-| Intent router / VAD / local TTS | Intent router and VAD **working**; wake word and TTS are still Vosk and pyttsx3 — see Roadmap. |
+| Intent router / VAD / local TTS | Intent router and VAD **working**; wake word is still Vosk — see Roadmap. |
 
 ---
 
@@ -31,7 +34,7 @@ status table below is honest about what is built and what isn't.
 The constraint that shaped this: **it has to work all day on a student budget,
 including offline, without a paid API.**
 
-`brain.py` is ~120 lines and routes across providers that are all
+`brain.py` routes across providers that are all
 OpenAI-compatible, so one client shape covers every one of them — only
 `base_url`, key and model name change. No gateway, no second daemon that has to
 be alive before a login-start assistant can work.
@@ -55,13 +58,19 @@ deep  →  claude → groq → gemini → openrouter → ollama (local)
   hours that are reliably dead, the cooldown covers a key draining early inside
   its window.
 
-The window is what makes a part-time key worth having in first position. A
-reseller key that only serves 16:30–18:30 gives me Sonnet during those two hours
-and costs exactly nothing — not even one failed request — for the other 22.
+The window is what makes a part-time key worth having in first position: a key
+that only serves a fixed slot costs exactly nothing — not even one failed
+request — for the hours it's dead. No provider currently declares one. It was
+built for a third-party reseller key that served a two-hour slot; that key is
+gone (see below), and its schedule went with it rather than being left on a
+provider it no longer describes.
 
-Every provider uses my own key on its own published free tier. No credential
-pooling, no free-tier aggregation across throwaway accounts, no TLS
-interception — all of which are the reason I did not adopt an off-the-shelf
+Every provider uses my own key on its own published free tier. That rules out
+the reseller this originally shipped with: a two-hour daily slot onto a pool
+that drained early is pooled capacity, not a licensed quota, and it contradicted
+the sentence above. Groq's free tier already covers what it was there for.
+No credential pooling, no free-tier aggregation across throwaway accounts, no
+TLS interception — all of which are the reason I did not adopt an off-the-shelf
 routing gateway for this.
 
 Adding a provider is one entry in `PROVIDERS` and one line in `CHAINS`.
@@ -112,6 +121,43 @@ split, and a per-turn net. Three things it does deliberately:
 What it can't measure is whether a given decision was *correct* — turns routed
 `fast` are easier turns, so the comparison is observational, and the report
 labels itself as an estimate rather than an experiment.
+
+### The cheapest turn never reaches a model
+
+Routing a turn to the fast tier makes it cheaper. Not routing it to a model at
+all makes it free. *"What time is it"* has exactly one right answer and
+`datetime` already knows it, so sending it to a language model costs a round
+trip to be told something the standard library could have said instantly — and,
+on a small local model, to occasionally be told it wrong, confidently, aloud.
+
+`handlers.py` sits in front of the agent loop and answers those directly. Two
+rules keep it from doing harm:
+
+- **Every pattern is a full match on the whole utterance, never a substring.**
+  The failure worth designing against is hijacking a turn that wanted real
+  thought: *"what do you think about the date on this contract"* contains "the
+  date" and must still reach the model. `fullmatch` is what makes that safe, and
+  it's the case the tests spend most of their time on.
+- **It only answers what is genuinely unambiguous.** *"Read my clipboard"* is
+  deliberately absent — nine times in ten that means "tell me what this says",
+  which is interpretation, and interpretation is the model's job. The test for
+  belonging here isn't "can I write a regex for it" but "is there exactly one
+  right answer, and does a library already know it".
+
+An explicit `/fast` or `/deep` stands the handlers down, which doubles as the
+escape hatch when one of them is wrong about a sentence.
+
+These are counted in `brain.jsonl` under `handled` and reported separately from
+the fast/deep split, for the same reason the voice stages live in their own
+file: a turn with no model call is not a routing decision, and folding it into
+those percentages would describe a classifier that never ran. The report gives a
+count and not a saving — what a handled turn costs is a regex, and what it
+*would* have cost is whatever tier it would have been routed to, which isn't
+observable precisely because it wasn't.
+
+ponytail: a hand-written pattern list, which is right at this size and wouldn't
+be at fifty. The upgrade is an intent classifier, and `answer()` is the only
+call site that changes.
 
 ---
 
@@ -198,6 +244,66 @@ the recording. The recording also holds the gap before he started and the 0.7s
 hang at the end, and both of those are silence he sat through. Filing them as
 speech would have shortened the reported wait by about a second — in the
 flattering direction, in the one number the whole measurement exists to produce.
+
+### Saying the same four things faster
+
+Most of what this says back is one of a handful of fixed lines: *"Yes, sir"* on
+every wake word, *"I didn't catch that"* on every misfire. Synthesising those
+live means the speech engine does identical work every time, and on the voice
+path that work is `ack` — a measured stage sitting between him finishing the
+wake word and the microphone reopening.
+
+So they're rendered to WAV once at startup and played from disk afterwards,
+which skips building an engine at all. Taken from hey-jev, which pre-renders its
+scripted lines for the same reason. Replies a model wrote still go through the
+engine live, because there is no second time for those.
+
+Two details that turned out to matter more than the caching:
+
+- **pyttsx3 only honours the first `say()` of an engine's life.** Three
+  consecutive utterances on one engine measured 3711ms, 174ms and 114ms — the
+  second and third returned without making a sound. That was a live bug, not a
+  theoretical one: the assistant would answer the first wake word and then be
+  mute until restarted, which from the outside looks like the *model* failing.
+  An engine is now built per utterance and disposed of, and the `gc.collect()`
+  that does the disposing is load-bearing — pyttsx3 keeps engines behind a weak
+  reference and hands the same one back from every `init()`, so without
+  collecting it the next utterance gets the spent engine and is silent.
+- **SAPI5 pads every rendered phrase with silence**, measured at 0.10s before
+  the first word and 0.70s after the last. Live speech doesn't do this, so it's
+  an artefact of rendering — and that trailing 0.7s is dead air he waits through
+  on every single wake word. `_trim()` strips it, which took the acknowledgement
+  from ~2300ms to ~1200ms. It bails rather than guesses in every direction: a
+  format it can't measure, a file with no frames, or audio that's silent
+  throughout all leave the file untouched. Shortening a file is an optimisation;
+  writing an empty one would be a phrase the assistant can no longer say.
+
+The cache is keyed by exact text, which is why the callers hold their phrases in
+named constants — pre-rendering *"Yes, sir"* and then speaking *"Yes sir"* is a
+cache that never hits and never says so.
+
+### Not answering what it didn't hear
+
+Whisper always returns its best guess, and on a bad capture its best guess is a
+plausible sentence made out of a cough and a fan. The scores that would have
+said so come back on every segment and were being thrown away — so a misheard
+command reached the model, which answered it confidently, out loud.
+
+`transcriber.py` now gates on two of them: the duration-weighted mean
+`avg_logprob` (around -0.2 on a clean short command, below -1.0 when Whisper is
+reaching) and the worst `no_speech_prob` across segments. A rejected transcript
+comes back as the empty string, which is already the shape `main.py` handles —
+it says *"I didn't catch that"* and waits, which is the right answer to not
+having heard. Also from hey-jev, which re-asks below a confidence threshold
+rather than acting on a guess.
+
+The mean is weighted by duration so half a second of noise can't outvote four
+seconds of a clear sentence, and `no_speech_prob` is the worst rather than the
+average because one segment confidently flagged as a door is enough — averaging
+would dilute exactly the signal worth acting on. Both thresholds are calibration
+knobs and both measured values are printed on every rejection, because *"it
+ignored me"* and *"it misheard me"* are one symptom from the outside and
+opposite numbers here.
 
 ---
 
@@ -299,8 +405,20 @@ All keys are optional — the router uses what's present and skips the rest.
 For the local floor:
 
 ```bash
-ollama pull qwen3:4b
+ollama pull qwen3:1.7b
 ```
+
+Keep it resident, or the first command of every sitting pays for the model
+loading off disk — measured at **70 seconds** on a 4GB card, which the router
+then records as a classification that took 70s and returned nothing:
+
+```bash
+setx OLLAMA_KEEP_ALIVE -1
+```
+
+Ollama unloads an idle model after 5 minutes by default, so an assistant used
+a few times an hour reloads it on *every* command. That default is for a server
+sharing a GPU between models; this is one small model that needs to answer now.
 
 Text mode:
 
@@ -332,10 +450,13 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
    nothing until something needs to *write*. Screen capture will be the first
    real `EXPLICIT` tool; the authorisation path it needs is already built and
    tested.
-2. **Voice rebuild** — VAD-terminated capture is in. Still to go: openWakeWord
-   replacing Vosk (which runs full ASR continuously just to hear one word),
-   Piper replacing pyttsx3, and a spoken filler on `deep` turns so a 2s think
-   doesn't read as a hang.
+2. **Voice rebuild** — VAD-terminated capture, a pre-rendered phrase cache and a
+   transcription confidence gate are in. Still to go: openWakeWord replacing
+   Vosk (which runs full ASR continuously just to hear one word), Piper
+   replacing pyttsx3, and a spoken filler on `deep` turns so a 2s think
+   doesn't read as a hang. Piper moved up the list after pyttsx3 turned out to
+   need a fresh engine per utterance to speak more than once — half a second of
+   setup before every unscripted reply, which a real TTS library doesn't charge.
 3. **Recall on demand** — memory is auto-injected only. A `recall` tool would
    let the model search with a better query than the raw utterance. Worth it
    once auto-recall measurably misses; not before.
@@ -348,6 +469,7 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
 ```
 backend/
   brain.py        model router — tiers, fallback chain, cooldown, service windows
+  handlers.py     commands answered with no model at all — time, date
   tools.py        execution layer — risk tiers, confirmation gate, action log
   memory.py       long-term memory — markdown notes, scored recall, remember tool
   measure.py      reads brain.jsonl back — tier latency, routing split, net
@@ -356,8 +478,8 @@ backend/
   profile.md      who I am, current projects (edit freely)
   main.py         voice loop: wake word → STT → agent → speech
   vad.py          ends a capture when he stops talking, on a calibrated level
-  transcriber.py  faster-whisper wrapper
-  tts.py          shared pyttsx3 engine
+  transcriber.py  faster-whisper wrapper + confidence gate
+  tts.py          speech — pre-rendered fixed phrases, engine per utterance
   rolling_buffer.py
   test_brain.py   router self-check (no network, no keys needed)
   test_tools.py   gate self-check (no network, no real writes)
@@ -365,8 +487,12 @@ backend/
   test_memory.py  recall self-check (notes in a temp dir)
   test_measure.py report self-check (synthetic log in a temp dir)
   test_vad.py     capture self-check (microphone scripted from a string)
+  test_handlers.py no-model handlers (no model, no mic)
+  test_tts.py     speech cache trimming (WAVs built by hand, no engine)
+  test_transcriber.py confidence gate (segments faked, no Whisper)
   memory/         one markdown file per remembered fact — gitignored
-  logs/           brain.jsonl, actions.jsonl — gitignored
+  cache/tts/      pre-rendered WAVs for the fixed phrases — gitignored
+  logs/           brain.jsonl, actions.jsonl, voice.jsonl — gitignored
 ```
 
 ## License
