@@ -13,7 +13,8 @@ so rather than quietly presenting it as an experiment.
 
 Two logs, read separately and never mixed:
 
-  brain.jsonl  model calls and routing decisions -- this file's original job.
+  brain.jsonl  model calls, routing decisions, and turns answered with no
+               model at all -- this file's original job.
   voice.jsonl  the stages the model calls sit inside: ack, record window,
                transcription, speech. Written by main.py.
 
@@ -140,6 +141,21 @@ def report(records: list[dict], bad: int = 0) -> str:
     skips = Counter(r["why"] for r in routes if "why" in r)
     for why, n in skips.most_common():
         out.append(f"  skipped: {why[:40]:<7}{n:>7}")
+
+    # Turns that never reached a model at all. Counted apart from the fast/deep
+    # split for the same reason the voice stages live in another file: a turn
+    # with no model call is not a routing decision, and folding these into the
+    # percentages above would describe a classifier that never ran on them.
+    #
+    # This is the cheapest latency in the system and the easiest to overstate,
+    # so it reports a count and not a saving. What a handled turn costs is a
+    # regex; what it would have cost is whatever tier it would have been routed
+    # to, which is not observable precisely because it wasn't.
+    handled = Counter(r["handled"] for r in records if "handled" in r)
+    if handled:
+        out.append(f"\nAnswered with no model{sum(handled.values()):>7}")
+        for name, n in handled.most_common():
+            out.append(f"  {name:<16}{n:>7}")
 
     classify = [r["ms"] for r in routes if "ms" in r]
     fast, deep = ms("fast"), ms("deep")

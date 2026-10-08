@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 import brain
+import handlers
 import memory
 import tools
 
@@ -33,6 +34,22 @@ class Agent:
         self.confirm = confirm
 
     def say(self, text: str, tier: str | None = None) -> str:
+        # Before any of this reaches a model. An explicit tier means he asked
+        # for one ("/deep what time is it"), so the handlers stand aside --
+        # which is also the escape hatch when one of them is wrong.
+        #
+        # Both sides of the exchange go into history, so a follow-up still has
+        # something to refer back to: "and in UTC?" needs the previous answer
+        # to exist even though no model produced it.
+        if tier is None and (handled := handlers.answer(text)) is not None:
+            name, reply = handled
+            self.history.append({"role": "user", "content": text})
+            self.history.append({"role": "assistant", "content": reply})
+            # No `ms`: the honest figure is sub-millisecond and the number worth
+            # having is the count -- how many turns never touched a model.
+            brain._log({"handled": name})
+            return reply
+
         # Routed before the turn goes into history, so the classifier sees the
         # last reply as context rather than the sentence it's classifying.
         # An explicit tier from a caller wins -- that's /fast and /deep.
