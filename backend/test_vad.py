@@ -69,8 +69,38 @@ def test_too_little_audio_to_calibrate_is_not_an_error():
 def test_a_silent_room_still_gets_a_usable_threshold():
     """A floor near zero would otherwise scale to a threshold near zero and
     turn mic hiss into speech, holding the capture open to max_sec."""
-    assert vad.threshold(0.0) == vad.MIN_RMS
-    assert vad.threshold(1000.0) == 3000.0
+    assert vad.threshold(0.0, 0.0) == vad.MIN_RMS
+    assert vad.threshold(0.0, 4000.0) == vad.MIN_RMS
+
+
+def test_the_threshold_lands_between_the_room_and_the_voice():
+    """Every level pair actually measured on this hardware.
+
+    The middle row is why the formula changed. `floor * 3` gave 14032 on this
+    laptop's mic array with Windows boost on, where speech peaked at 11446 --
+    a bar louder than the person talking, so the capture could never start.
+    Turning the microphone up had made the assistant deaf, which is not a
+    direction anyone would think to debug.
+
+    Both numbers move together, because gain raises the floor as much as the
+    voice. That is why a geometric mean holds where a fixed multiple doesn't.
+    """
+    for floor, loud in ((79, 259), (4677, 11446), (5, 3996)):
+        level = vad.threshold(float(floor), float(loud))
+        assert level < loud, f"floor={floor} loud={loud}: bar above the voice"
+        assert level >= vad.MIN_RMS, f"floor={floor} loud={loud}: below the hiss"
+
+
+def test_levels_reads_the_room_and_the_voice_off_one_buffer():
+    """The rolling buffer holds both: seconds of room ending in the wake word.
+    The quiet fifth is the room and the loud top is him, which is the pair
+    needed to put a threshold between them."""
+    floor, loud = vad.levels(_pcm(100, 80) + _pcm(4000, 20))
+    assert floor < 500, f"speech leaked into the floor: {floor}"
+    assert loud > 3000, f"the voice was averaged away: {loud}"
+    assert vad.threshold(floor, loud) < 4000, "the bar must sit under the voice"
+    # Nothing to measure is not a quiet room; it is no answer at all.
+    assert vad.levels(b"") == (0.0, 0.0)
 
 
 def test_capture_ends_after_a_run_of_quiet():

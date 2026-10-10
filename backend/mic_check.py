@@ -17,6 +17,8 @@ Run: python mic_check.py
 import json
 import sys
 import time
+import wave
+from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
@@ -49,13 +51,13 @@ def main():
     # ---- level ----------------------------------------------------------
     peak = int(np.abs(audio).max())
     overall = vad.rms(audio.tobytes())
-    floor = vad.noise_floor(audio.tobytes(), SAMPLERATE)
-    level = vad.threshold(floor)
+    floor, loud = vad.levels(audio.tobytes(), SAMPLERATE)
+    level = vad.threshold(floor, loud)
     loudest = max(
         vad.rms(audio[i:i + 480].tobytes()) for i in range(0, len(audio) - 480, 480)
     )
     print(f"[level] peak {peak} of 32768 ({100 * peak / 32768:.1f}% of full scale)")
-    print(f"[level] overall rms {overall:.0f}, quietest fifth {floor:.0f}")
+    print(f"[level] overall rms {overall:.0f}, room {floor:.0f}, voice {loud:.0f}")
     print(f"[level] loudest 30ms frame {loudest:.0f}, vs vad threshold {level:.0f}")
 
     if peak == 0:
@@ -63,10 +65,26 @@ def main():
         print("  blocking microphone access for Python (Settings > Privacy &")
         print("  security > Microphone). Nothing below will work until that does.")
         return
+    if peak > 32000:
+        print("\n  Clipping. The signal is hitting the ceiling and the loud parts")
+        print("  are being squared off, which recognisers hear as distortion.")
+        print("  Turn the Windows mic level or boost DOWN, not up.")
     if loudest < level:
         print("\n  Audio arrived, but nothing in it was loud enough to count as")
         print("  speech, so the VAD would never start recording a command.")
         print("  Raise the mic level in Windows, or lower MIN_RMS in vad.py.")
+
+    # Kept so the same recording can be replayed against a different
+    # recogniser without asking him to say it again -- which is the difference
+    # between testing an idea in a second and in a minute.
+    out = Path(__file__).parent / "cache" / "mic_check.wav"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(out), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLERATE)
+        w.writeframes(audio.tobytes())
+    print(f"\n[saved] {out}")
 
     # ---- vosk, the wake word --------------------------------------------
     vosk.SetLogLevel(-1)
