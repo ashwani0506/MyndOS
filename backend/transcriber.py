@@ -46,9 +46,22 @@ def confidence(segments) -> tuple[float, float]:
 class Transcriber:
     def __init__(self,
                  model_size="base.en",
-                 compute_type="auto",
-                 device="auto"):  # cuda when available, else cpu — don't hard-crash on a machine without it
-        print("[transcriber] Loading Whisper model...")
+                 compute_type="int8",
+                 device="cpu"):
+        """CPU and int8 by design, not as a fallback.
+
+        `device="auto"` picked the GPU here and then raised "Library
+        cublas64_12.dll is not found" on the first encode -- so every
+        transcription failed, which on the voice path took the whole loop with
+        it. CUDA for this needs a cuBLAS the machine doesn't have.
+
+        Worth it even once that's installed: the local LLM is pinned resident
+        in VRAM (brain.py's keep_alive), and on a 4GB card there isn't room for
+        both. base.en in int8 reads a short command on CPU in well under a
+        second and leaves the GPU to the model that actually needs it -- which
+        is what the README has claimed all along.
+        """
+        print(f"[transcriber] Loading Whisper model ({model_size}, {device}/{compute_type})...")
         self.model = WhisperModel(
             model_size,
             compute_type=compute_type,

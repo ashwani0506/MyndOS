@@ -185,8 +185,18 @@ def main():
                     # Three seconds covers that; the other seven are the room.
                     audio_to_transcribe = buffer.tail(PRE_ROLL_SEC) + command
 
-                    # Transcribe
-                    transcription = transcriber.transcribe_bytes(audio_to_transcribe)
+                    # Transcribe. Wrapped for the same reason reply() is: this
+                    # loop is meant to survive from login to shutdown, so a
+                    # bad turn costs a turn. It was the one unwrapped stage,
+                    # and a Whisper that raises on every call -- a missing CUDA
+                    # library, as it turned out -- took the whole assistant
+                    # down on the first wake word rather than one command.
+                    try:
+                        transcription = transcriber.transcribe_bytes(audio_to_transcribe)
+                    except Exception as e:
+                        print(f"[main] transcribe failed: {type(e).__name__}: {e}",
+                              file=sys.stderr)
+                        transcription = ""
                     clock.lap("transcribe")
                     print(f"[main] User said: {transcription}")
 
