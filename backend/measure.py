@@ -42,7 +42,7 @@ VOICE_LOG = HERE / "logs" / "voice.jsonl"
 # Fixed order, so the report reads top-to-bottom in the order the turn happens
 # rather than in whatever order the log happens to hold.
 VOICE_STAGES = (
-    "teardown",   # closing the Vosk stream
+    "teardown",   # closing the resident mic stream
     "calibrate",  # noise floor off the rolling buffer
     "ack",        # "Yes, sir" -- guessed at before this existed
     "capture",    # mic open until the VAD ends it

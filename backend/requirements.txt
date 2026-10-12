@@ -1,7 +1,7 @@
 openai>=1.60            # one client for every OpenAI-compatible provider (see brain.py)
 python-dotenv>=1.0
 
-vosk>=0.3.45            # wake-word ASR (always-on)
+openwakeword>=0.6.0     # wake word: one small model for one phrase (see wakeword.py)
 faster-whisper>=1.1.0   # command transcription (CTranslate2, no torch needed)
 sounddevice>=0.4.6      # mic capture
 numpy>=1.26

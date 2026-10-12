@@ -13,7 +13,7 @@ status table below is honest about what is built and what isn't.
 
 | Component | State |
 |---|---|
-| Wake word → STT → TTS loop | **Working.** Vosk wake word, faster-whisper transcription, pyttsx3 speech. |
+| Wake word → STT → TTS loop | **Working.** openWakeWord ("hey jarvis"), faster-whisper transcription, pyttsx3 speech. |
 | Model router (`brain.py`) | **Working.** Tiered, multi-provider, cooldown-aware fallback, plus intent routing per turn. |
 | Trusted execution layer (`tools.py`) | **Working.** Risk-tiered registry, confirmation gate, action log. |
 | Tools | Clipboard read, scoped file read, confirmed file write, remember a fact. |
@@ -25,7 +25,8 @@ status table below is honest about what is built and what isn't.
 | Voice → agent | **Built, not yet verified end to end.** `main.py` drives the same `Agent` as the REPL, so every voice command goes through the gate and the log — but no complete spoken turn has been recorded yet (`logs/voice.jsonl` is still empty). Promoted to *working* when it has turns in it. |
 | Long-term memory | **Working.** Markdown notes on disk, recalled into the prompt before the model sees the turn. |
 | Measurement (`measure.py`) | **Working.** Reads the brain log back: tier latency, routing split, and whether the router nets out positive. |
-| Intent router / VAD / local TTS | Intent router and VAD **working**; wake word is still Vosk — see Roadmap. |
+| Wake word (`wakeword.py`) | **Working.** openWakeWord's pretrained `hey_jarvis`, one 1.2MB classifier instead of continuous full ASR. |
+| Intent router / VAD / local TTS | Intent router and VAD **working**; TTS is still pyttsx3 — see Roadmap. |
 
 ---
 
@@ -161,6 +162,63 @@ call site that changes.
 
 ---
 
+## Hearing its own name
+
+Vosk ran a full speech recogniser continuously in order to spot a single word,
+and on real audio it never once managed it. *"Jarvis"*, said into this laptop's
+microphone, came back as:
+
+```
+"journalists with time is it"     mic array, boost +20dB
+"chat with what time is it"       mic array, boost +10dB
+"this your time is it"            headset, clean levels, floor of 5
+"huh"                             mic array, no boost
+```
+
+Four attempts across three microphone configurations, including one with
+genuinely good levels. Whisper, on the same recordings, got it one time in
+three. And the word is *not* missing from Vosk's lexicon — fed synthesised
+speech it transcribes *"jarvis what time is it"* perfectly. So this was never a
+vocabulary problem. **A general recogniser listening for one rare proper noun is
+the wrong instrument** — like hiring a translator to listen for a doorbell.
+
+`wakeword.py` uses openWakeWord's pretrained `hey_jarvis` instead: one 1.2MB
+classifier trained on one phrase. Measured on the same five seconds:
+
+```
+openWakeWord, the phrase it was trained on    0.998
+openWakeWord, a recording missing the "hey"   0.487
+Vosk, that same recording                     "chat with what time is it"
+```
+
+0.487 is below the 0.5 firing line — but that is a model getting most of the way
+there on a phrase *with its first word absent*, recorded on a microphone whose
+voice-to-room ratio was 2.2x. That gap is the whole argument. It also costs a
+fraction of the CPU, because it scores one small classifier instead of decoding
+every word anyone in the room says, all day.
+
+The phrase is **"hey jarvis"**, not "jarvis". That's what the pretrained model
+is for, and it's better regardless: two syllables are far harder to trigger by
+accident than one moderately common name.
+
+Two details that are easy to get wrong:
+
+- **Audio arrives in the caller's block size and the model wants exactly 80ms.**
+  `_windows()` carries the remainder between calls, because a wake word landing
+  on a block boundary would otherwise be scored as two halves and recognised as
+  neither. It's a pure function, so `test_wakeword.py` tests that seam with no
+  model and no microphone — which is where this would have failed silently.
+- **The queue in front of the detector gets drained after every turn.** The
+  audio captured between the wake word firing and the stream closing is the tail
+  of *"hey jarvis"* plus the command itself, and handing it back afterwards can
+  start a second turn on words already answered.
+
+Dropping Vosk also dropped a dependency and its model. Block size went from
+8000 samples to 1280 — the model's own window — so detection reacts six times
+sooner, at a cost of 12 callbacks a second instead of 2.
+
+---
+
 ## Knowing when he stopped talking
 
 The loop used to record for exactly three seconds after the wake word, so
@@ -175,12 +233,30 @@ no new dependency — numpy was already here for the audio path.
 Two things make it work rather than merely exist:
 
 - **The threshold is calibrated per command, not hard-coded.** A laptop fan, an
-  air conditioner and a quiet room are three different rooms. The level is read
-  off the audio already sitting in the rolling buffer — ambient by definition,
-  since it is what the mic heard *before* the wake word. It's the 20th
-  percentile of frame loudness rather than the mean, because that buffer ends
-  with the wake word and so isn't pure ambience; a mean would be dragged up by
-  the speech in it and set a threshold that then ignores the next sentence.
+  air conditioner and a quiet room are three different rooms. The levels are
+  read off the audio already sitting in the rolling buffer, which holds both
+  halves of what's needed: seconds of room, ending in the wake word. The
+  quietest fifth is the room and the loudest top is him, and the threshold is
+  the **geometric mean of the two**, which lands between them wherever they sit.
+  Percentiles rather than means on both ends, because that buffer isn't pure
+  ambience and a mean would be dragged toward whichever it contains more of.
+
+  That formula replaced `floor * 3`, and the reason is worth keeping. With
+  Windows mic boost turned on, this laptop's array measured a floor of 4677 and
+  speech peaking at 11446 — only 2.4x apart, because gain raises the room as
+  much as the voice. Three times the floor is 14032: **a bar louder than the
+  person talking**, so the capture could never start. Turning the microphone up
+  had made the assistant deaf, which is not a direction anyone would think to
+  debug. Against every level pair measured on real hardware here:
+
+  ```
+  floor   loud     old     new
+     79    259     237     180    quiet mic, cleared by 9%
+   4677  11446   14032    7317    boosted mic, was impossible
+      5   3996     180     180    headset, fine either way
+  ```
+
+  The old formula only worked on the third row.
 - **Only quiet *after* speech ends the capture.** A pause for breath is shorter
   than the hang time, which is the whole reason that constant isn't smaller.
   Cutting someone off mid-sentence is a worse failure than half a second of
@@ -192,10 +268,14 @@ the whole decision is testable with no audio device. The two tests that matter
 are the two failure modes: cutting him off at a pause, and recording an empty
 room until the ceiling.
 
-Whisper now sees 3s of pre-roll plus the command instead of a flat 13s. The
-pre-roll is load-bearing rather than padding: Vosk only reports an utterance
-once it has ended, so by the time *"what time is it, jarvis"* fires the wake
-word, the command has already been spoken.
+Whisper now sees 1s of pre-roll plus the command instead of a flat 13s. The
+pre-roll used to be 3s and load-bearing: Vosk only reported an utterance once it
+had *ended*, so by the time *"what time is it, jarvis"* fired the wake word the
+command had already been spoken, and the buffer was the only place it existed.
+openWakeWord fires on the phrase itself, so the command is still ahead of us —
+what's left is a short guard in case he runs into it before the acknowledgement
+finishes. The wake phrase lands in that second, and `handlers._normalise` strips
+it back out.
 
 ponytail: RMS can't tell speech from a slammed door, so a loud noise can hold
 the capture open to its ceiling. Fine for a desk mic in a room with one person;
@@ -401,6 +481,12 @@ pip install -r backend/requirements.txt
 cp .env.example .env    # fill in whichever keys you have
 ```
 
+The wake-word models are a separate download, once:
+
+```bash
+python -c "import openwakeword.utils; openwakeword.utils.download_models()"
+```
+
 All keys are optional — the router uses what's present and skips the rest.
 For the local floor:
 
@@ -408,13 +494,15 @@ For the local floor:
 ollama pull qwen3:1.7b
 ```
 
-Keep it resident, or the first command of every sitting pays for the model
-loading off disk — measured at **70 seconds** on a 4GB card, which the router
-then records as a classification that took 70s and returned nothing:
-
-```bash
-setx OLLAMA_KEEP_ALIVE -1
-```
+Nothing else to configure for the local model: `brain.py` sends `keep_alive` with
+every request, so it stays resident without an environment variable. That
+matters because Ollama drops an idle model after five minutes, and an assistant
+used a few times an hour would otherwise reload 1.7GB off disk on *every*
+command — measured at **154 seconds** cold on this 4GB card, against **431ms**
+warm. It's sent in the request body rather than read from `OLLAMA_KEEP_ALIVE`
+because on Windows the desktop app auto-starts the server, so a `setx` after
+that does nothing until a reboot, and a fresh clone inherits none of it. The
+latency decision belongs next to the latency, not in a shell profile.
 
 Ollama unloads an idle model after 5 minutes by default, so an assistant used
 a few times an hour reloads it on *every* command. That default is for a server
@@ -430,14 +518,22 @@ python backend/agent.py
 registry with each tool's risk tier. `/stats` reports routing and latency.
 `/fast <message>` and `/deep <message>` override the router for one turn.
 
-Voice mode (wake word "Jarvis"):
+Voice mode (wake phrase **"hey jarvis"**):
 
 ```bash
 python backend/main.py
 ```
 
-On a 4GB GPU, keep the LLM on CUDA and let Whisper run on CPU — `base.en` in
-int8 transcribes a short command in well under a second and leaves the VRAM free.
+Whisper runs on CPU in int8, and the honest reason is not the one this README
+used to give. It claimed a 4GB card has no room for both Whisper and the LLM;
+`base.en` in int8 is about 150MB of VRAM against the model's 1.7GB, so there is
+plenty of room and that argument was wrong. The real reason is that
+`device="auto"` picked the GPU and then raised *"Library cublas64_12.dll is not
+found"* on the first encode — every transcription failed, and on the voice path
+that took the whole loop with it. On CPU it loads in 1.7s and reads a short
+command in under 600ms, which is inside the budget. Installing cuBLAS and moving
+to `small.en` is on the roadmap, and is worth doing for the accuracy as much as
+the speed.
 
 ---
 
@@ -450,13 +546,24 @@ int8 transcribes a short command in well under a second and leaves the VRAM free
    nothing until something needs to *write*. Screen capture will be the first
    real `EXPLICIT` tool; the authorisation path it needs is already built and
    tested.
-2. **Voice rebuild** — VAD-terminated capture, a pre-rendered phrase cache and a
-   transcription confidence gate are in. Still to go: openWakeWord replacing
-   Vosk (which runs full ASR continuously just to hear one word), Piper
-   replacing pyttsx3, and a spoken filler on `deep` turns so a 2s think
-   doesn't read as a hang. Piper moved up the list after pyttsx3 turned out to
-   need a fresh engine per utterance to speak more than once — half a second of
-   setup before every unscripted reply, which a real TTS library doesn't charge.
+2. **Voice rebuild** — openWakeWord (replacing Vosk), VAD-terminated capture, a
+   pre-rendered phrase cache and a transcription confidence gate are all in.
+   Still to go, in the order the measurements justify:
+   - **A tone instead of a spoken acknowledgement.** Saying *"Yes, sir"* costs
+     ~1200ms before the microphone even reopens, and it's the largest fixed cost
+     in a turn after the reply itself. Every production assistant uses a tone —
+     ~150ms, and a tone can't talk over you.
+   - **Piper replacing pyttsx3.** Speaking the reply is ~2400ms, the single
+     biggest item in a turn. pyttsx3 is also the reason an engine has to be
+     built per utterance just to speak twice.
+   - **`small.en` on CUDA.** Transcripts like *"Charlie's work time is it"* say
+     `base.en` is marginal; hey-jev uses `small.en` for the same reason.
+     `small.en` on CPU would be too slow, so this is one change, not two:
+     install cuBLAS 12 and move up a model size, which buys accuracy *and*
+     latency together. `base.en` in int8 is ~150MB of VRAM, so the README's old
+     claim that a 4GB card has no room alongside the LLM was simply wrong — the
+     real blocker was always the missing CUDA library.
+   - A spoken filler on `deep` turns, so a 2s think doesn't read as a hang.
 3. **Recall on demand** — memory is auto-injected only. A `recall` tool would
    let the model search with a better query than the raw utterance. Worth it
    once auto-recall measurably misses; not before.
@@ -477,9 +584,11 @@ backend/
   persona.md      voice and behaviour (edit freely)
   profile.md      who I am, current projects (edit freely)
   main.py         voice loop: wake word → STT → agent → speech
+  wakeword.py     "hey jarvis" — one small classifier, not continuous ASR
   vad.py          ends a capture when he stops talking, on a calibrated level
   transcriber.py  faster-whisper wrapper + confidence gate
   tts.py          speech — pre-rendered fixed phrases, engine per utterance
+  mic_check.py    records once and says which stage didn't hear it
   rolling_buffer.py
   test_brain.py   router self-check (no network, no keys needed)
   test_tools.py   gate self-check (no network, no real writes)
@@ -487,6 +596,7 @@ backend/
   test_memory.py  recall self-check (notes in a temp dir)
   test_measure.py report self-check (synthetic log in a temp dir)
   test_vad.py     capture self-check (microphone scripted from a string)
+  test_wakeword.py block/window seam (no model, no onnxruntime, no mic)
   test_handlers.py no-model handlers (no model, no mic)
   test_tts.py     speech cache trimming (WAVs built by hand, no engine)
   test_transcriber.py confidence gate (segments faked, no Whisper)

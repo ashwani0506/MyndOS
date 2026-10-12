@@ -1,20 +1,23 @@
 """Microphone check: records you once, then shows what each stage heard.
 
 Run this when the voice loop isn't reacting. It puts the same five seconds of
-audio through both recognisers, which is what separates the three failures that
-look identical from the outside:
+audio through both models, which is what separates the failures that look
+identical from the outside:
 
-  nothing arrives          -> the device or Windows microphone permission
-  audio arrives but quiet  -> mic gain, and the VAD thresholds in vad.py
-  Whisper hears it, Vosk doesn't -> the wake-word stage specifically
+  nothing arrives            -> the device, or Windows microphone permission
+  arrives but clipping       -> boost set too high; the loud parts square off
+  arrives but quiet          -> mic gain, and the thresholds in vad.py
+  Whisper hears it, wake word doesn't -> the phrase, or the wake stage itself
 
-Vosk is fed in the same half-second chunks as main.py, through the same
-AcceptWaveform/Result cycle, so a wake word that fails here fails there too.
+It also saves the recording, so one capture can be replayed against a changed
+threshold or a different model instead of being re-recorded each time.
+
+Everything runs through the same WakeWord and the same block size as main.py,
+so a phrase that fires here fires there.
 
 Run: python mic_check.py
 """
 
-import json
 import sys
 import time
 import wave
@@ -22,14 +25,13 @@ from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
-import vosk
 
 import vad
 
 SAMPLERATE = 16000
 SECONDS = 5
-BLOCKSIZE = 8000  # main.py's chunk size, so this exercises the same path
-PHRASE = "jarvis what time is it"
+BLOCKSIZE = 1280  # main.py's block size, so this exercises the same path
+PHRASE = "hey jarvis what time is it"
 
 
 def main():
@@ -86,30 +88,26 @@ def main():
         w.writeframes(audio.tobytes())
     print(f"\n[saved] {out}")
 
-    # ---- vosk, the wake word --------------------------------------------
-    vosk.SetLogLevel(-1)
-    rec = vosk.KaldiRecognizer(vosk.Model(lang="en-us"), SAMPLERATE)
-    finals, partial = [], ""
-    for i in range(0, len(audio), BLOCKSIZE):
-        chunk = audio[i:i + BLOCKSIZE].tobytes()
-        if rec.AcceptWaveform(chunk):
-            finals.append(json.loads(rec.Result()).get("text", ""))
-        else:
-            partial = json.loads(rec.PartialResult()).get("partial", "")
-    finals.append(json.loads(rec.FinalResult()).get("text", ""))
-    heard = " ".join(t for t in finals if t.strip())
+    # ---- the wake word --------------------------------------------------
+    # Scored through the same WakeWord the loop uses, in the same block size,
+    # so a phrase that fires here fires there.
+    from wakeword import WakeWord, PHRASE, THRESHOLD
 
-    print(f"\n[vosk] final:   {heard!r}")
-    print(f"[vosk] partial: {partial!r}")
-    # main.py only ever inspects Result(), so a word that shows up solely in a
-    # partial is a word the loop never sees -- worth saying out loud.
-    if "jarvis" in heard:
-        print('[vosk] "jarvis" FOUND in a final result -- the loop would wake.')
-    elif "jarvis" in partial:
-        print('[vosk] "jarvis" is in the PARTIAL but not a final result. main.py')
-        print("       only reads Result(), so it would not wake on this.")
+    detector = WakeWord()
+    best, fired = 0.0, False
+    for i in range(0, len(audio), BLOCKSIZE):
+        hit = detector.heard(audio[i:i + BLOCKSIZE].tobytes())
+        best = max(best, detector.last_score)
+        fired = fired or hit
+
+    print(f"\n[wake] best score {best:.3f}, threshold {THRESHOLD}")
+    if fired:
+        print(f'[wake] {PHRASE!r} FOUND -- the loop would wake on this.')
+    elif best > THRESHOLD * 0.6:
+        print(f'[wake] close, but under the line. Say "{PHRASE}" as two clear')
+        print("       words, and check the levels above for clipping.")
     else:
-        print('[vosk] "jarvis" not heard.')
+        print(f'[wake] {PHRASE!r} not heard. Note it needs the "hey".')
 
     # ---- whisper, for comparison ----------------------------------------
     print("\n[whisper] loading...")
@@ -119,13 +117,13 @@ def main():
 
     # ---- verdict --------------------------------------------------------
     print("\n--- verdict ---")
-    if "jarvis" in heard:
+    if fired:
         print("  Wake word works. If the loop still doesn't react, the problem is")
         print("  in main.py's stream, not in recognition.")
     elif text.strip():
-        print("  Whisper heard you and Vosk did not. The audio is fine and the")
-        print("  wake-word stage is the problem -- which is the case for")
-        print("  replacing Vosk with openWakeWord rather than tuning it.")
+        print("  Whisper heard you and the wake-word model didn't fire. The audio")
+        print(f'  is fine, so this is about the phrase: it must be "{PHRASE}",')
+        print("  said as two words, and the levels above must not be clipping.")
     else:
         print("  Neither heard anything. Treat this as a level problem first:")
         print("  check the [level] lines above before touching either model.")
