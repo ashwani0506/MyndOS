@@ -1,5 +1,4 @@
 import sounddevice as sd
-import numpy as np
 import queue
 import sys
 import time
@@ -117,9 +116,15 @@ def main():
     def callback(indata, frames, time, status):
         if status:
             print(status, file=sys.stderr)
-        # Convert to mono int16 bytes
-        data = indata.copy().flatten()
-        data_bytes = (data * 32767).astype(np.int16).tobytes()
+        # int16 straight from the driver, no rescaling. It used to arrive as
+        # float32 and get multiplied by 32767, which silently wrapped: any
+        # sample the driver delivered above full scale -- routine with Windows
+        # mic boost on -- came out as a large *negative* number. That shreds
+        # exactly the loudest syllables, which are the ones carrying the wake
+        # word, and it is why mic_check scored a near miss on the same voice
+        # that this loop heard nothing from: mic_check asks the driver for
+        # int16 and never touched this path.
+        data_bytes = indata.copy().flatten().tobytes()
 
         buffer.add_chunk(data_bytes)
         q_in.put(data_bytes)
@@ -131,7 +136,7 @@ def main():
             channels=CHANNELS,
             samplerate=SAMPLERATE,
             blocksize=BLOCKSIZE,
-            dtype='float32',
+            dtype='int16',
             callback=callback
         )
         stream.start()
@@ -148,11 +153,17 @@ def main():
     # Start the mic initially
     start_stream()
 
+    # Peak score of whatever he just said, while it stays above NOTICE. Printed
+    # once when it falls back, so a near miss is one line per attempt rather
+    # than twelve a second -- and so "it didn't react" comes with a number.
+    near_peak = 0.0
+
     try:
         while True:
             data_bytes = q_in.get()
 
             if detector.heard(data_bytes):
+                near_peak = 0.0
                 print(f"[wakeword] heard {wakeword.PHRASE!r} "
                       f"(score {detector.last_score:.2f})")
                 clock = Stopwatch()
@@ -256,6 +267,13 @@ def main():
                 # Restart mic after all TTS is done
                 start_stream()
 
+            elif detector.last_score >= wakeword.NOTICE:
+                near_peak = max(near_peak, detector.last_score)
+            elif near_peak:
+                print(f"[wakeword] heard something at {near_peak:.2f}, under "
+                      f"the {wakeword.THRESHOLD} line -- say {wakeword.PHRASE!r}")
+                near_peak = 0.0
+
     except KeyboardInterrupt:
         print("[main] Exiting.")
     finally:
@@ -265,10 +283,10 @@ def main():
 def record_command(level):
     """Record until he stops talking. Returns (audio, seconds he spoke).
 
-    A dedicated int16 stream, read a frame at a time: the resident stream is
-    float32 in 80ms blocks to suit the wake-word model, and neither suits a
-    30ms decision. Reading int16 directly also drops the rescaling the
-    callback has to do.
+    A dedicated int16 stream, read a frame at a time: the resident stream uses
+    80ms blocks to suit the wake-word model, which doesn't suit a 30ms
+    decision. Both read int16 directly from the driver -- nothing in this
+    pipeline wants float.
     """
     n = int(SAMPLERATE * vad.FRAME_MS / 1000)
     stream = sd.InputStream(

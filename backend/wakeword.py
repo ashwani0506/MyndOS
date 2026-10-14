@@ -30,6 +30,11 @@ import numpy as np
 
 FRAME = 1280        # 80ms at 16kHz -- the window the model expects
 THRESHOLD = 0.5     # openWakeWord's own suggested default
+# Worth mentioning but not worth waking for. "Nothing happened" is the least
+# useful thing a wake word can report: it covers a dead microphone, a wrong
+# device, a mangled signal and a phrase that merely came close, and those need
+# opposite fixes. A score above this gets printed so the difference is visible.
+NOTICE = 0.2
 PHRASE = "hey jarvis"
 MODEL = "hey_jarvis"
 
