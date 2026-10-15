@@ -292,6 +292,42 @@ Dropping Vosk also dropped a dependency and its model. Block size went from
 8000 samples to 1280 — the model's own window — so detection reacts six times
 sooner, at a cost of 12 callbacks a second instead of 2.
 
+### Where the threshold came from
+
+openWakeWord suggests 0.5. At 0.5 the phrase had to be said three or four times
+per turn — `0.49, 0.39, 0.45, 0.61` — and those repeats were what read as a
+*delay between turns* rather than as a missed wake word, which is why it was
+reported as the wrong problem.
+
+Two measurements set it, and they are the only two that matter: how high
+unrelated speech scores, and how low a real attempt scores.
+
+```
+213s of recorded speech with no wake phrase    worst 0.359
+my own attempts, weakest to strongest          0.45 .. 0.82
+```
+
+The false-positive corpus is three screen-recorded videos of people talking
+about assistants. One of them had to be thrown out of it: it scored 0.994,
+because the presenter says *"just ask, hey Jarvis, play my favourite music"* —
+a true positive sitting in the middle of what was supposed to be a negative set.
+Worth stating, because a corpus that silently contains the thing it's meant to
+exclude would have argued for a threshold above every real attempt.
+
+**0.40** sits near the midpoint of the gap. The asymmetry points the same way: a
+missed phrase costs saying it again, while a false wake costs attention and
+nothing else — it cannot *act*, because an `EXPLICIT` tool is unlocked only by
+words in my own utterance and a `CONFIRM` tool stops for a click. There's also a
+hotkey now, so voice isn't the only way in.
+
+`test_wakeword.py` holds both numbers, so moving the threshold has to argue with
+the measurements rather than with a hunch.
+
+ponytail: one threshold on one window. If false wakes ever turn up in practice,
+requiring two consecutive windows over the line rejects a single-frame phonetic
+coincidence while keeping the lower bar, for 80ms and a little state. Not before
+there is one to fix.
+
 ---
 
 ## Knowing when he stopped talking

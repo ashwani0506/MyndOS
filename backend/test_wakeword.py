@@ -72,6 +72,26 @@ def test_a_large_block_yields_every_window_in_it():
     assert tail.size == 8000 % wakeword.FRAME
 
 
+def test_the_threshold_sits_in_the_measured_gap():
+    """The threshold is set from two measurements, and this is where they live
+    so that moving it has to argue with them.
+
+        213s of recorded speech with no wake phrase   worst 0.359
+        his own attempts, weakest to strongest        0.45 .. 0.82
+
+    Above the first and below the second, or it is the wrong number. At
+    openWakeWord's suggested 0.5 he was saying the phrase three and four times
+    a turn, and those repeats were what read as a delay between turns.
+    """
+    worst_false_positive = 0.359
+    weakest_real_attempt = 0.45
+
+    assert wakeword.THRESHOLD > worst_false_positive, "will wake on other speech"
+    assert wakeword.THRESHOLD < weakest_real_attempt, "will miss his quiet attempts"
+    # And NOTICE has to stay below the line, or a near miss is never reported.
+    assert wakeword.NOTICE < wakeword.THRESHOLD
+
+
 def test_the_phrase_has_a_hey_on_the_front():
     """The pretrained model is "hey jarvis", and handlers.py strips both words
     from a transcript. If this constant ever disagrees with that, the wake

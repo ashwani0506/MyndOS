@@ -29,7 +29,28 @@ accident than one common-ish name.
 import numpy as np
 
 FRAME = 1280        # 80ms at 16kHz -- the window the model expects
-THRESHOLD = 0.5     # openWakeWord's own suggested default
+# Measured, not guessed, and the two numbers that set it are the only two that
+# matter: how high unrelated speech scores, and how low a real attempt scores.
+#
+#   213s of recorded speech containing no wake phrase   worst 0.359
+#   his own attempts, weakest to strongest              0.45 .. 0.82
+#
+# openWakeWord suggests 0.5. At 0.5 he was saying it three and four times per
+# turn -- 0.49, 0.39, 0.45, then 0.61 -- and the repeated attempts were what
+# read as a delay between turns. 0.40 sits near the midpoint of the gap, clear
+# of the false-positive ceiling and under the weakest genuine attempt.
+#
+# The asymmetry says lean this way too. A missed phrase costs saying it again.
+# A false wake costs attention and nothing else: it cannot act, because an
+# EXPLICIT tool is unlocked only by words in his own utterance and a CONFIRM
+# tool stops for a click. There is also a hotkey now, so voice is no longer
+# the only way in.
+#
+# ponytail: a single threshold on a single window. If false wakes ever show up
+# in practice, requiring two consecutive windows over the line is the next
+# move -- it rejects a one-frame phonetic coincidence while keeping the lower
+# bar, at the cost of 80ms and some state. Not before there is one to fix.
+THRESHOLD = 0.40
 # Worth mentioning but not worth waking for. "Nothing happened" is the least
 # useful thing a wake word can report: it covers a dead microphone, a wrong
 # device, a mangled signal and a phrase that merely came close, and those need
