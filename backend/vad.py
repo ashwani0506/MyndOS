@@ -105,6 +105,44 @@ def threshold(floor: float, loud: float) -> float:
     return max((floor * loud) ** 0.5, MIN_RMS)
 
 
+def queue_reader(q, samplerate: int = 16000, timeout: float = 1.0):
+    """A frame reader over whatever block size a stream happens to deliver.
+
+    `capture` wants FRAME_MS at a time; an audio callback delivers whatever
+    block size suits the thing it was opened for. This carries the remainder
+    between calls so a capture never loses the seam between two blocks.
+
+    It exists because the alternative wedged the machine. The capture used to
+    open a *second* microphone stream of its own, at its own block size, while
+    the resident one was closed -- two open/close cycles on the same device per
+    turn. On the second turn PortAudio's blocking `read()` never returned, and
+    because it releases the GIL, Ctrl-C was queued and never ran: the session
+    had to be killed from outside.
+
+    So the timeout is the point, more than the buffering. A reader that cannot
+    deliver returns **silence** rather than blocking, which lets `capture`
+    reach its own exits -- lead-in or hang -- and end the turn with "I didn't
+    catch that". A microphone that dies mid-capture now costs one turn instead
+    of the process.
+    """
+    import queue as _queue  # stdlib, and only needed for the Empty sentinel
+
+    frame_bytes = int(samplerate * FRAME_MS / 1000) * 2  # int16
+    tail = bytearray()
+
+    def read_frame() -> bytes:
+        nonlocal tail
+        while len(tail) < frame_bytes:
+            try:
+                tail += q.get(timeout=timeout)
+            except _queue.Empty:
+                return bytes(frame_bytes)
+        frame, tail = bytes(tail[:frame_bytes]), bytearray(tail[frame_bytes:])
+        return frame
+
+    return read_frame
+
+
 def capture(
     read_frame,
     level: float,

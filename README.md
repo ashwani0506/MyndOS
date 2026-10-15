@@ -379,14 +379,43 @@ the whole decision is testable with no audio device. The two tests that matter
 are the two failure modes: cutting him off at a pause, and recording an empty
 room until the ceiling.
 
-Whisper now sees 1s of pre-roll plus the command instead of a flat 13s. The
+### One microphone stream, and why that's a correctness fix
+
+The capture used to open a **second** stream of its own, at its own block size,
+while the resident one was closed — two open/close cycles on the same device per
+turn. On the second turn, PortAudio's blocking `read()` never returned. Because
+it releases the GIL, `Ctrl-C` was queued and never ran: the session had to be
+killed from outside.
+
+So there is now one stream for the life of the process, and `vad.queue_reader`
+feeds `capture()` from the same queue the wake word reads. It carries the
+remainder between calls, since 80ms blocks in and 30ms frames out don't divide.
+
+**The timeout is the real point, more than the buffering.** A reader that can't
+deliver returns *silence* rather than blocking, so `capture()` reaches its own
+exits — lead-in or hang — and the turn ends with *"I didn't catch that"*. A
+microphone that dies mid-capture now costs one turn instead of the process.
+That's a structural guarantee rather than a bet on having diagnosed the device
+correctly, which matters because I hadn't: the hang was found before its cause
+was.
+
+Never closing the stream means the microphone hears the assistant's own
+acknowledgement and its own reply, so the queue is drained twice a turn — once
+after the acknowledgement, so *"Yes, sir"* isn't read as the command, and once
+at the end, so the reply isn't handed back to the wake-word detector. An
+assistant that wakes itself up is a loop with no exit.
+
+It also recovered the ~290ms of stream churn, which was the original reason to
+do it and turned out to be the least important one.
+
+Whisper sees the command, plus 1s of pre-roll **on the hotkey path only**. The
 pre-roll used to be 3s and load-bearing: Vosk only reported an utterance once it
 had *ended*, so by the time *"what time is it, jarvis"* fired the wake word the
 command had already been spoken, and the buffer was the only place it existed.
-openWakeWord fires on the phrase itself, so the command is still ahead of us —
-what's left is a short guard in case he runs into it before the acknowledgement
-finishes. The wake phrase lands in that second, and `handlers._normalise` strips
-it back out.
+openWakeWord fires on the phrase itself, so the command is still ahead of us.
+What's left is a guard for running into the command early — which only makes
+sense where nothing was spoken, since on the wake-word path the buffer was just
+cleared of the acknowledgement.
 
 ponytail: RMS can't tell speech from a slammed door, so a loud noise can hold
 the capture open to its ceiling. Fine for a desk mic in a room with one person;

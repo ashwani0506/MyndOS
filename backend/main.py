@@ -97,6 +97,24 @@ def reply(agent: Agent, transcription: str) -> str:
         return f"Something broke: {type(e).__name__}. It's in the terminal."
 
 
+FRAME_BYTES = int(SAMPLERATE * vad.FRAME_MS / 1000) * 2  # 30ms of int16
+
+
+def drain(q_in: queue.Queue) -> None:
+    """Throw away whatever is queued.
+
+    Used twice a turn, for the same reason both times: the microphone is never
+    closed any more, so it hears the assistant's own acknowledgement and its
+    own reply. Those must not be read as the command, and must not be handed
+    back to the wake-word detector afterwards.
+    """
+    while not q_in.empty():
+        try:
+            q_in.get_nowait()
+        except queue.Empty:
+            return
+
+
 def main():
     print("[main] Loading wake-word model...")
     detector = WakeWord()
@@ -111,9 +129,6 @@ def main():
     agent = Agent(confirm=confirm_aloud)
 
     q_in = queue.Queue()
-
-    # Define a stream variable outside so we can start/stop it
-    stream = None
 
     def callback(indata, frames, time, status):
         if status:
@@ -131,26 +146,19 @@ def main():
         buffer.add_chunk(data_bytes)
         q_in.put(data_bytes)
 
-    def start_stream():
-        nonlocal stream
-        stream = sd.InputStream(
-            device=DEVICE,
-            channels=CHANNELS,
-            samplerate=SAMPLERATE,
-            blocksize=BLOCKSIZE,
-            dtype='int16',
-            callback=callback
-        )
-        stream.start()
-        print("[main] Microphone stream started.")
-
-    def stop_stream():
-        nonlocal stream
-        if stream:
-            stream.stop()
-            stream.close()
-            stream = None
-            print("[main] Microphone stream stopped.")
+    # One stream, opened once, closed on the way out. Everything -- the wake
+    # word and the command capture both -- reads the queue it feeds. It used to
+    # be stopped and restarted around every turn, plus a second stream opened
+    # for the capture, and the second turn hung inside PortAudio's read()
+    # hard enough to need the terminal killed.
+    stream = sd.InputStream(
+        device=DEVICE,
+        channels=CHANNELS,
+        samplerate=SAMPLERATE,
+        blocksize=BLOCKSIZE,
+        dtype='int16',
+        callback=callback,
+    )
 
     panel = ui.Panel()
     key = Hotkey()
@@ -170,7 +178,13 @@ def main():
         point of having it there.
         """
         clock = Stopwatch()
-        stop_stream()
+        # The stream is deliberately *not* closed here any more. It used to be,
+        # so the acknowledgement couldn't leak into the microphone, and reopened
+        # at the end of the turn -- two open/close cycles per turn on the same
+        # device. That cost 290ms, and on the second turn PortAudio's read()
+        # never returned: a hard hang, uninterruptible by Ctrl-C because the GIL
+        # was released inside it. The leak is dealt with by draining the queue,
+        # which is cheaper and cannot wedge a device.
         clock.lap("teardown")
 
         # Measured before the acknowledgement, off the whole buffer: ten
@@ -193,20 +207,44 @@ def main():
         panel.state("listening", trigger)
         if trigger == "wake word":
             tts.speak(ACK)
+            # Everything the microphone heard while that played -- which
+            # includes the acknowledgement itself, now that the stream stays
+            # open. Without this the capture reads "Yes, sir" as the command.
+            drain(q_in)
+            buffer.clear()
         clock.lap("ack")
 
-        command, spoke = record_command(level)
+        # A fresh reader per turn, so no half-frame is carried over from the
+        # last one. Wrapped so the meter keeps moving while he talks: the main
+        # loop isn't running during a capture, and that is the one moment the
+        # readout most needs to show the microphone is live. Every third frame,
+        # because Tk redrawing 33 times a second to animate a bar of blocks
+        # would be the capture's own biggest cost.
+        read = vad.queue_reader(q_in, SAMPLERATE)
+        seen = 0
+
+        def watched() -> bytes:
+            nonlocal seen
+            frame = read()
+            seen += 1
+            if seen % 3 == 0:
+                panel.level(vad.rms(frame))
+            return frame
+
+        command, spoke = vad.capture(watched, level)
         clock.lap("capture")
         recorded = len(command) / (SAMPLERATE * 2)
         print(f"[vad] recorded {recorded:.1f}s, {spoke:.1f}s of speech")
 
         panel.state("thinking")
 
-        # A short pre-roll, in case he ran into the command before the
-        # acknowledgement finished. It is no longer where the command lives --
-        # see PRE_ROLL_SEC -- and the wake phrase itself lands in here, which
-        # handlers._normalise strips back out.
-        audio_to_transcribe = buffer.tail(PRE_ROLL_SEC) + command
+        # Pre-roll on the hotkey path only. Nothing was spoken there, so the
+        # buffer holds the room plus any command he ran into early -- worth
+        # having. On the wake-word path the buffer was just cleared of the
+        # acknowledgement, so there is nothing in it but the acknowledgement's
+        # own silence.
+        pre_roll = buffer.tail(PRE_ROLL_SEC) if trigger == "hotkey" else b""
+        audio_to_transcribe = pre_roll + command
 
         # Transcribe. Wrapped for the same reason reply() is: this loop is
         # meant to survive from login to shutdown, so a bad turn costs a turn.
@@ -265,19 +303,15 @@ def main():
         # The detector scores a rolling window, so the tail of the phrase is
         # still inside it; on the hotkey path nothing reset it at all.
         detector.reset()
-        # And drop whatever the callback queued between the trigger and the
-        # stream closing. That audio is the tail of "hey jarvis" plus the
-        # command itself, and handing it back to the detector can start a
-        # second turn on words already answered.
-        while not q_in.empty():
-            q_in.get_nowait()
+        # And drop everything the microphone heard during the turn -- the reply
+        # it just spoke, most of all. Handing that back to the detector is how
+        # an assistant wakes itself up.
+        drain(q_in)
 
         panel.state("idle")
-        # Restart mic after all TTS is done
-        start_stream()
 
-    # Start the mic initially
-    start_stream()
+    stream.start()
+    print("[main] Microphone stream started.")
     panel.state("idle")
     print(f"[main] Say {wakeword.PHRASE!r}, or press Right Ctrl.")
 
@@ -322,28 +356,10 @@ def main():
     except KeyboardInterrupt:
         print("[main] Exiting.")
     finally:
-        stop_stream()
-        panel.close()
-
-
-def record_command(level):
-    """Record until he stops talking. Returns (audio, seconds he spoke).
-
-    A dedicated int16 stream, read a frame at a time: the resident stream uses
-    80ms blocks to suit the wake-word model, which doesn't suit a 30ms
-    decision. Both read int16 directly from the driver -- nothing in this
-    pipeline wants float.
-    """
-    n = int(SAMPLERATE * vad.FRAME_MS / 1000)
-    stream = sd.InputStream(
-        device=DEVICE, channels=CHANNELS, samplerate=SAMPLERATE, dtype='int16'
-    )
-    stream.start()
-    try:
-        return vad.capture(lambda: stream.read(n)[0].tobytes(), level)
-    finally:
         stream.stop()
         stream.close()
+        print("[main] Microphone stream stopped.")
+        panel.close()
 
 
 if __name__ == "__main__":

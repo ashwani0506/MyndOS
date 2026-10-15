@@ -103,6 +103,47 @@ def test_levels_reads_the_room_and_the_voice_off_one_buffer():
     assert vad.levels(b"") == (0.0, 0.0)
 
 
+def test_the_queue_reader_reslices_blocks_into_frames():
+    """The stream delivers 80ms blocks and capture wants 30ms frames, so the
+    remainder has to carry between calls or a capture loses the seam."""
+    import queue
+
+    q = queue.Queue()
+    q.put(_pcm(LOUD, 1) * 8)          # one 80ms-ish block, as the callback sends
+    read = vad.queue_reader(q)
+    first = read()
+    assert len(first) == FRAME * 2, "a frame is FRAME samples of int16"
+    # The rest of that block is still available without another put().
+    assert len(read()) == FRAME * 2
+
+
+def test_a_dead_microphone_returns_silence_instead_of_blocking():
+    """The bug this function was written for. The capture used to open its own
+    stream and read it blocking; on the second turn PortAudio never returned,
+    and because it releases the GIL, Ctrl-C was queued and never ran -- the
+    session had to be killed from outside.
+
+    An empty queue now reads as silence, so capture reaches its own exits and
+    the turn ends with "I didn't catch that". A microphone that dies mid-turn
+    costs a turn, not the process.
+    """
+    import queue
+    import time
+
+    q = queue.Queue()
+    read = vad.queue_reader(q, timeout=0.01)
+
+    started = time.time()
+    frame = read()
+    assert frame == bytes(FRAME * 2), "an empty queue must read as silence"
+    assert time.time() - started < 1.0, "it blocked instead of giving up"
+
+    # And capture, handed that reader, still terminates rather than hanging.
+    audio, spoke = vad.capture(read, LEVEL, **SHORT)
+    assert spoke == 0.0
+    assert audio, "it should still return the silence it collected"
+
+
 def test_capture_ends_after_a_run_of_quiet():
     frames, spoke = _cap("..!!!!")
     assert frames == 9  # 2 lead-in + 4 speech + 3 hang
