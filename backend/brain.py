@@ -123,15 +123,26 @@ def _in_window(window: tuple[str, str], now: datetime.time | None = None) -> boo
 def _listening(base_url: str, timeout: float = 0.2) -> bool:
     """Is anything actually accepting connections there?
 
-    Only asked of local providers, and only by status(). A local server needs
-    no key, so api_key() hands one out unconditionally -- which means every
-    other check passes for a provider that isn't installed, and status()
-    reports a dead port as "ready". That is a lie in the one place whose whole
-    job is telling you what is live.
+    Asked of local providers only. A local server needs no key, so api_key()
+    hands one out unconditionally -- which means every other check passes for a
+    provider that isn't installed or isn't running.
 
-    Not wired into _chain(): a refused connection to localhost costs under a
-    millisecond and the cooldown absorbs it, so paying a probe on every call to
-    save that would be the more expensive mistake.
+    This used to be status()-only, on the reasoning that a refused connection
+    to localhost costs under a millisecond and the cooldown would absorb it.
+    That was wrong by four orders of magnitude. Measured against a dead port:
+
+        OpenAI client, default retries   13,700ms
+        OpenAI client, max_retries=0      4,042ms
+        this probe                           410ms
+
+    13.7s is what a stopped Ollama cost in the middle of a voice turn, and it
+    was the largest single number in the whole pipeline -- larger than the
+    model, the microphone and the speech engine put together.
+
+    A connection that is *accepted* returns in well under a millisecond, so the
+    probe costs nothing in the case that matters; and _chain benches the
+    provider when it fails, so even the 410ms is paid once per cooldown rather
+    than once per call.
     """
     url = urlparse(base_url)
     try:
@@ -275,7 +286,16 @@ def _log(record: dict) -> None:
 
 
 def _chain(tier: str) -> list[Provider]:
-    """Providers for this tier with a model, a key, in-window, not cooling down."""
+    """Providers for this tier with a model, a key, in-window, live, not cooling.
+
+    The liveness probe is local-only and is what keeps a stopped Ollama from
+    costing 13.7 seconds mid-turn. It also repairs classify()'s guard: that
+    function refuses to classify unless the fast chain *starts* local, and with
+    a dead ollama still sitting at the head of the chain the guard passed, the
+    classification went out over the network, and it cost a 13.7s failure to
+    reach a provider whose answer then came back empty. Excluding a server that
+    isn't running makes the first entry honest, so the guard does its job.
+    """
     now = time.time()
     out = []
     for name in CHAINS[tier]:
@@ -284,8 +304,17 @@ def _chain(tier: str) -> list[Provider]:
             continue
         if p.window and not _in_window(p.window):
             continue
-        if _cooldown.get(name, 0) < now:
-            out.append(p)
+        if _cooldown.get(name, 0) >= now:
+            continue
+        if p.local and not _listening(p.base_url):
+            # Benched, so the probe is paid once per cooldown and not once per
+            # call -- and so status() reports it the same way as any other
+            # provider that isn't answering.
+            _cooldown[name] = now + p.cooldown
+            _log({"tier": tier, "provider": name, "ok": False,
+                  "error": "not listening"})
+            continue
+        out.append(p)
     return out
 
 
@@ -346,6 +375,12 @@ def complete(messages: list[dict], tier: str = "deep", purpose: str = "answer", 
                     "tier": tier,
                     "purpose": purpose,
                     "provider": p.name,
+                    # Failures are timed too. Without this the most expensive
+                    # thing in the pipeline was invisible: a stopped Ollama
+                    # took 13.7s to fail and the log recorded only that it
+                    # had, so the voice report blamed 15s on "action" with
+                    # nothing underneath it to explain where the time went.
+                    "ms": round((time.time() - started) * 1000),
                     "ok": False,
                     "error": str(e),
                 }

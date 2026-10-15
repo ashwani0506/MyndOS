@@ -55,6 +55,16 @@ deep  →  claude → groq → gemini → openrouter → ollama (local)
   degrades instead of going dark.
 - **Failures cool down, they don't retry.** A provider that returns 429 or fails
   auth is skipped for 10 minutes, so one wasted request replaces one per command.
+- **A local server is probed before it's used.** This was originally
+  `status()`-only, on the reasoning that a refused connection to localhost costs
+  nothing. Measured against a dead port, the OpenAI client takes **13,700ms** to
+  give up — it retries — and 4,042ms with retries disabled. The probe takes
+  410ms, and under a millisecond when the port is actually open. A stopped
+  Ollama was the single largest number anywhere in the pipeline, bigger than the
+  model, the microphone and the speech engine combined. It also repaired
+  `classify()`'s guard: that refuses to classify unless the fast chain *starts*
+  local, and a dead Ollama sitting at the head of the chain let it pass, so the
+  classification went over the network and came back empty anyway.
 - **Known-dead hours are skipped on the clock.** A provider can declare a
   `window` — the local-time range its key actually serves. Outside it the
   provider is never tried at all. The two mechanisms compose: the window covers

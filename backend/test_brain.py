@@ -12,6 +12,20 @@ from pathlib import Path
 
 import brain
 
+# Liveness is stubbed for the whole file. Every test here is about a routing
+# decision, and _chain now probes local providers -- so without this, each one
+# would pass or fail depending on whether Ollama happens to be running on this
+# machine at this moment. A self-check that depends on background services is
+# not checking the thing it claims to.
+_REAL_LISTENING = brain._listening
+brain._listening = lambda url, timeout=0.2: True
+
+
+def _dead_local(up: bool = False):
+    """Point the liveness probe at a stopped server (or a running one)."""
+    brain._listening = lambda url, timeout=0.2: up
+    brain._cooldown.clear()
+
 
 def test_window_bounds_are_inclusive():
     w = ("16:30", "18:30")
@@ -99,16 +113,20 @@ def test_no_providers_raises_rather_than_hanging():
         raise AssertionError("expected NoProviderAvailable")
 
 
-def test_status_does_not_report_a_dead_local_port_as_ready():
-    """A local server needs no key, so every other check passes for one that
-    isn't installed -- and status() called it "ready" while the router it
-    fronts silently did nothing. Loopback only; no network."""
-    assert not brain._listening("http://localhost:1/v1")
+def test_the_liveness_probe_tells_a_dead_port_from_a_live_one():
+    """The real probe, not the stub -- this is the one test about the socket
+    rather than about routing. A local server needs no key, so every other
+    check passes for one that isn't running, and before this existed the router
+    spent 13.7s finding that out the expensive way. Loopback only; no network.
+    """
+    assert not _REAL_LISTENING("http://localhost:1/v1")
 
     with socket.socket() as srv:
         srv.bind(("127.0.0.1", 0))
         srv.listen(1)
-        assert brain._listening(f"http://127.0.0.1:{srv.getsockname()[1]}/v1")
+        # A connection that is accepted returns immediately, which is why the
+        # probe is free in the case that actually matters.
+        assert _REAL_LISTENING(f"http://127.0.0.1:{srv.getsockname()[1]}/v1")
 
 
 def test_status_says_so_when_routing_is_off():
@@ -252,8 +270,35 @@ def _answers(text, *, boom=False):
 
 def _local_fast_chain():
     """Make the fast chain start on ollama, which is what classify requires."""
-    brain._cooldown.clear()
+    _dead_local(up=True)
     assert brain._chain("fast")[0].local, "expected ollama at the head of fast"
+
+
+def test_a_stopped_local_server_leaves_the_chain_instead_of_timing_out():
+    """The most expensive thing that ever happened in this pipeline.
+
+    A stopped Ollama took 13,700ms to fail -- larger than the model, the
+    microphone and the speech engine put together -- because the OpenAI client
+    retries a refused connection. The probe costs 410ms on a dead port and
+    under a millisecond on a live one.
+
+    It also repairs classify()'s guard. That function refuses to classify
+    unless the fast chain *starts* local; with a dead ollama still at the head
+    it passed, the classification went over the network anyway, and the reply
+    came back empty. With ollama excluded, the head is a cloud provider, the
+    guard trips, and no model is called at all.
+    """
+    os.environ["GROQ_API_KEY"] = "x"
+    _dead_local(up=False)
+
+    assert "ollama" not in [p.name for p in brain._chain("fast")]
+    # Benched, so the probe is paid once per cooldown rather than per call.
+    assert brain._cooldown.get("ollama", 0) > time.time()
+    # And the guard now sees a non-local head and declines without a round trip.
+    assert brain.classify("what time is it") == "deep"
+
+    _dead_local(up=True)
+    assert "ollama" in [p.name for p in brain._chain("fast")]
 
 
 def test_a_reflexive_request_routes_to_fast():
