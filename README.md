@@ -26,6 +26,8 @@ status table below is honest about what is built and what isn't.
 | Long-term memory | **Working.** Markdown notes on disk, recalled into the prompt before the model sees the turn. |
 | Measurement (`measure.py`) | **Working.** Reads the brain log back: tier latency, routing split, and whether the router nets out positive. |
 | Wake word (`wakeword.py`) | **Working.** openWakeWord's pretrained `hey_jarvis`, one 1.2MB classifier instead of continuous full ASR. |
+| Status panel (`ui.py`) | **Working.** Always-on-top strip: state, level meter, what it heard, what it replied. |
+| Push-to-talk (`hotkey.py`) | **Working.** Right Ctrl starts a turn with no wake word and no spoken acknowledgement. |
 | Intent router / VAD / local TTS | Intent router and VAD **working**; TTS is still pyttsx3 — see Roadmap. |
 
 ---
@@ -159,6 +161,69 @@ observable precisely because it wasn't.
 ponytail: a hand-written pattern list, which is right at this size and wouldn't
 be at fifty. The upgrade is an intent classifier, and `answer()` is the only
 call site that changes.
+
+---
+
+## Two ways in, and a window that says which
+
+At login there is no terminal. Every `[vad]`, `[wakeword]` and `[transcriber]`
+line that made this debuggable is invisible to the person actually using it —
+and those lines describe exactly the failures that look identical from outside:
+not hearing, mishearing, and hearing but failing to answer. So `ui.py` puts them
+on screen, in an always-on-top strip:
+
+```
+● Listening · hotkey    ███████████···
+You: what time is it
+It's 5:14 PM.
+```
+
+A state dot, a level meter, what it heard and what it said. The level meter is
+square-rooted, because loudness isn't linear to the eye any more than to the
+ear — a linear bar sits at nothing through ordinary speech and then slams to the
+end on one loud word.
+
+**No animation anywhere, deliberately.** A voice turn is synchronous on this
+thread — the model call blocks it — so Tk cannot repaint mid-turn. A spinner
+that is supposed to be spinning and isn't reads as a crash, which is strictly
+worse than no spinner. The pattern throughout is: set the state, pump once, then
+do the slow thing. A static label saying *Thinking* is honest about exactly as
+much as it knows.
+
+One structural consequence: **a process gets one Tk root.** `ask_dialog` and
+`read_clipboard` each used to create their own, which worked only because
+neither outlived the other. A panel that stays up all session makes that a
+conflict, so `ui.root()` owns a single hidden root and everything else puts a
+`Toplevel` on it. The confirmation dialog uses `wait_window` for its modal loop
+rather than `mainloop()`, which the voice loop would never return from.
+
+### Right Ctrl
+
+The wake word is the convenience path. **The hotkey is the reliable one** — no
+model, no calibration, no "hey", no quiet room. That isn't theoretical: the wake
+word spent a week not working, and the cause was four separate bugs stacked on
+each other. An assistant reachable only by voice is one bad microphone away from
+being unreachable.
+
+It also skips the spoken acknowledgement, and the reasoning generalises: if he
+pressed a key he is at the keyboard looking at the panel, which reads
+*Listening* the instant the turn opens, so 1200ms of *"Yes, sir"* buys nothing.
+A wake word may have come from across the room, where the panel can't be read
+and the only acknowledgement worth having is audible. `measure.py` now breaks
+turns down by trigger, so that claim is a number rather than an argument:
+
+```
+By trigger        p50     p95      n
+  hotkey             3900    3900      2
+  wake word          5000    5000      1
+```
+
+Polled from the audio loop with `GetAsyncKeyState` rather than registered as a
+Windows hot key — the loop already wakes every 80ms, so the worst case is 80ms
+of lag against a message pump that would want its own thread and a window handle
+to receive on. The edge detection is the part worth testing: without remembering
+the previous state, a key held for half a second is six polls and therefore six
+turns, and `test_hotkey.py` scripts a keyboard out of a string to prove it isn't.
 
 ---
 
@@ -518,7 +583,7 @@ python backend/agent.py
 registry with each tool's risk tier. `/stats` reports routing and latency.
 `/fast <message>` and `/deep <message>` override the router for one turn.
 
-Voice mode (wake phrase **"hey jarvis"**):
+Voice mode (wake phrase **"hey jarvis"**, or **Right Ctrl** for push-to-talk):
 
 ```bash
 python backend/main.py
@@ -547,22 +612,23 @@ the speed.
    real `EXPLICIT` tool; the authorisation path it needs is already built and
    tested.
 2. **Voice rebuild** — openWakeWord (replacing Vosk), VAD-terminated capture, a
-   pre-rendered phrase cache and a transcription confidence gate are all in.
-   Still to go, in the order the measurements justify:
-   - **A tone instead of a spoken acknowledgement.** Saying *"Yes, sir"* costs
-     ~1200ms before the microphone even reopens, and it's the largest fixed cost
-     in a turn after the reply itself. Every production assistant uses a tone —
-     ~150ms, and a tone can't talk over you.
+   pre-rendered phrase cache, a transcription confidence gate, the status panel
+   and push-to-talk are all in. The spoken acknowledgement is already skipped on
+   the hotkey path, which is the cheap half of that saving; still to go, in the
+   order the measurements justify:
+   - **A tone instead of a spoken acknowledgement on the wake-word path.**
+     *"Yes, sir"* costs ~1200ms there, and the panel can't help from across the
+     room. ~150ms, and a tone can't talk over you.
    - **Piper replacing pyttsx3.** Speaking the reply is ~2400ms, the single
      biggest item in a turn. pyttsx3 is also the reason an engine has to be
      built per utterance just to speak twice.
-   - **`small.en` on CUDA.** Transcripts like *"Charlie's work time is it"* say
-     `base.en` is marginal; hey-jev uses `small.en` for the same reason.
-     `small.en` on CPU would be too slow, so this is one change, not two:
-     install cuBLAS 12 and move up a model size, which buys accuracy *and*
-     latency together. `base.en` in int8 is ~150MB of VRAM, so the README's old
-     claim that a 4GB card has no room alongside the LLM was simply wrong — the
-     real blocker was always the missing CUDA library.
+   - **`small.en` on CUDA.** Less pressing than it was: the wake word is a
+     dedicated model now, so Whisper no longer has to get a proper noun right,
+     and proper nouns were what `base.en` kept mangling. The trigger is
+     `measure.py` showing `transcribe` in the top two, or `base.en` fumbling
+     actual commands rather than the name. `base.en` in int8 is ~150MB of VRAM,
+     so the README's old claim that a 4GB card has no room alongside the LLM was
+     simply wrong — the real blocker was always the missing cuBLAS.
    - A spoken filler on `deep` turns, so a 2s think doesn't read as a hang.
 3. **Recall on demand** — memory is auto-injected only. A `recall` tool would
    let the model search with a better query than the raw utterance. Worth it
@@ -584,6 +650,8 @@ backend/
   persona.md      voice and behaviour (edit freely)
   profile.md      who I am, current projects (edit freely)
   main.py         voice loop: wake word → STT → agent → speech
+  ui.py           the one Tk root, and the status panel on it
+  hotkey.py       Right Ctrl push-to-talk, polled from the audio loop
   wakeword.py     "hey jarvis" — one small classifier, not continuous ASR
   vad.py          ends a capture when he stops talking, on a calibrated level
   transcriber.py  faster-whisper wrapper + confidence gate
@@ -597,6 +665,7 @@ backend/
   test_measure.py report self-check (synthetic log in a temp dir)
   test_vad.py     capture self-check (microphone scripted from a string)
   test_wakeword.py block/window seam (no model, no onnxruntime, no mic)
+  test_hotkey.py  push-to-talk edges (keyboard scripted from a string)
   test_handlers.py no-model handlers (no model, no mic)
   test_tts.py     speech cache trimming (WAVs built by hand, no engine)
   test_transcriber.py confidence gate (segments faked, no Whisper)

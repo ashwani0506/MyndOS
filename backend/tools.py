@@ -169,6 +169,11 @@ def ask_dialog(t: Tool, args: dict) -> bool:
     voice loop drives the agent from main(), and the audio callback never
     reaches the gate.
 
+    It is a `Toplevel` on the shared root rather than a `Tk()` of its own,
+    because the status panel now holds that root for the whole session and a
+    process only gets one. `wait_window` gives it a modal event loop without a
+    `mainloop()` the voice loop would never return from.
+
     ponytail: shows the call's *arguments*, not its *effect* -- "write_file,
     path=notes.md" doesn't say notes.md already holds 400 lines about to be
     gone. Deliberate: the dialog works for every CONFIRM tool because it knows
@@ -179,8 +184,11 @@ def ask_dialog(t: Tool, args: dict) -> bool:
     """
     import tkinter as tk
 
+    import ui
+
     try:
-        root = tk.Tk()
+        parent = ui.root()
+        win = tk.Toplevel(parent)
     except Exception:
         # No display, no Tk. Refusing is the only safe answer -- falling back
         # to input() would reintroduce the exact hang this exists to avoid.
@@ -191,35 +199,35 @@ def ask_dialog(t: Tool, args: dict) -> bool:
     def allow():
         nonlocal allowed
         allowed = True
-        root.destroy()
+        win.destroy()
 
-    root.title("MyndOS needs confirmation")
-    root.attributes("-topmost", True)
-    root.resizable(False, False)
-    root.protocol("WM_DELETE_WINDOW", root.destroy)  # the X is a no
-    root.bind("<Escape>", lambda _: root.destroy())
+    win.title("MyndOS needs confirmation")
+    win.attributes("-topmost", True)
+    win.resizable(False, False)
+    win.protocol("WM_DELETE_WINDOW", win.destroy)  # the X is a no
+    win.bind("<Escape>", lambda _: win.destroy())
 
     detail = "\n".join(f"{k} = {_preview(v)}" for k, v in args.items()) or "(no arguments)"
     tk.Label(
-        root, text=t.description, wraplength=440, justify="left",
+        win, text=t.description, wraplength=440, justify="left",
         font=("", 10, "bold"),
     ).pack(padx=16, pady=(16, 6), anchor="w")
     tk.Label(
-        root, text=f"{t.name}\n{detail}", wraplength=440, justify="left", fg="#555",
+        win, text=f"{t.name}\n{detail}", wraplength=440, justify="left", fg="#555",
     ).pack(padx=16, pady=(0, 14), anchor="w")
 
-    row = tk.Frame(root)
+    row = tk.Frame(win)
     row.pack(padx=16, pady=(0, 16), anchor="e")
-    tk.Button(row, text="Deny", width=10, command=root.destroy).pack(side="right")
+    tk.Button(row, text="Deny", width=10, command=win.destroy).pack(side="right")
     tk.Button(row, text="Allow", width=10, command=allow).pack(side="right", padx=8)
 
     # Unanswered is a no. Without this, a dialog raised while he is away wedges
     # the loop as thoroughly as the stdin prompt did -- just visibly.
-    root.after(int(CONFIRM_TIMEOUT_SEC * 1000), root.destroy)
+    win.after(int(CONFIRM_TIMEOUT_SEC * 1000), win.destroy)
 
-    root.lift()
-    root.focus_force()
-    root.mainloop()
+    win.lift()
+    win.focus_force()
+    parent.wait_window(win)
     return allowed
 
 
@@ -294,14 +302,16 @@ def schemas() -> list[dict]:
 def read_clipboard() -> str:
     import tkinter
 
-    root = tkinter.Tk()
-    root.withdraw()
+    import ui
+
+    # The shared root, and emphatically not destroyed afterwards: the status
+    # panel is a child of it, so tearing it down here would take the panel --
+    # and the next confirmation dialog -- with it.
+    root = ui.root()
     try:
         return root.clipboard_get()
     except tkinter.TclError:
         return ""  # empty, or holding something that isn't text
-    finally:
-        root.destroy()
 
 
 @tool(

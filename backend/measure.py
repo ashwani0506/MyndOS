@@ -267,6 +267,24 @@ def voice_report(records: list[dict], bad: int = 0) -> str:
     for stage in VOICE_STAGES:
         out.append(_row(stage, _stage(turns, stage)))
 
+    # Split by what started the turn. The hotkey path deliberately skips the
+    # spoken acknowledgement -- he pressed a key, so he is at the keyboard
+    # watching the panel, and 1200ms of "Yes, sir" buys nothing there. This is
+    # the number that says whether that was worth doing, rather than me
+    # asserting it in a comment.
+    #
+    # Turns with no `trigger` predate the split and are counted as their own
+    # group, not folded into either: calling them all wake words would be
+    # inventing data about the one thing this table exists to compare.
+    by_trigger: dict[str, list[int]] = {}
+    for r in turns:
+        if "total_ms" in r:
+            by_trigger.setdefault(r.get("trigger", "unrecorded"), []).append(r["total_ms"])
+    if len(by_trigger) > 1:
+        out.append(f"\nBy trigger{'p50':>11}{'p95':>8}{'n':>7}")
+        for name, xs in sorted(by_trigger.items()):
+            out.append(_row(name, xs))
+
     # The headline. A stage table answers "which part is slow"; this answers
     # "how long after I stopped talking did it answer", which is the question
     # the person waiting actually has. Sum-of-stages would be the same number

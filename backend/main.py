@@ -6,10 +6,12 @@ import time
 from rolling_buffer import RollingBuffer
 from transcriber import Transcriber
 from tts import tts
+from hotkey import Hotkey
 from wakeword import WakeWord
 import brain
 import measure
 import tools
+import ui
 import vad
 import wakeword
 from agent import Agent
@@ -150,8 +152,134 @@ def main():
             stream = None
             print("[main] Microphone stream stopped.")
 
+    panel = ui.Panel()
+    key = Hotkey()
+
+    def take_turn(trigger: str) -> None:
+        """One voice turn, however it was started.
+
+        The trigger is not cosmetic. A hotkey turn skips the spoken
+        acknowledgement: if he pressed a key he is at the keyboard looking at
+        the panel, which reads "Listening" the instant this is called, so
+        1200ms of "Yes, sir" buys nothing. A wake word may have come from
+        across the room, where the panel can't be read and the only
+        acknowledgement worth anything is an audible one.
+
+        `clock.lap("ack")` happens either way, so the stages still tile the
+        turn -- it just measures roughly zero on the hotkey path, which is the
+        point of having it there.
+        """
+        clock = Stopwatch()
+        stop_stream()
+        clock.lap("teardown")
+
+        # Measured before the acknowledgement, off the whole buffer: ten
+        # seconds of the actual room is a better sample of it than anything
+        # measurable after. Both levels come from the same audio because it
+        # holds both -- room, ending in the wake word.
+        floor, loud = vad.levels(buffer.get_audio(), SAMPLERATE)
+        level = vad.threshold(floor, loud)
+        clock.lap("calibrate")
+        # Printed because "it didn't hear me" and "it never stopped recording"
+        # are one symptom from the outside and opposite numbers here.
+        # "(floor)" means the room measured quieter than MIN_RMS, so the
+        # threshold is the hard minimum rather than anything this room told us.
+        print(
+            f"[vad] room {floor:.0f}, voice {loud:.0f}, "
+            f"speech above {level:.0f}"
+            + (" (floor)" if level == vad.MIN_RMS else "")
+        )
+
+        panel.state("listening", trigger)
+        if trigger == "wake word":
+            tts.speak(ACK)
+        clock.lap("ack")
+
+        command, spoke = record_command(level)
+        clock.lap("capture")
+        recorded = len(command) / (SAMPLERATE * 2)
+        print(f"[vad] recorded {recorded:.1f}s, {spoke:.1f}s of speech")
+
+        panel.state("thinking")
+
+        # A short pre-roll, in case he ran into the command before the
+        # acknowledgement finished. It is no longer where the command lives --
+        # see PRE_ROLL_SEC -- and the wake phrase itself lands in here, which
+        # handlers._normalise strips back out.
+        audio_to_transcribe = buffer.tail(PRE_ROLL_SEC) + command
+
+        # Transcribe. Wrapped for the same reason reply() is: this loop is
+        # meant to survive from login to shutdown, so a bad turn costs a turn.
+        # It was the one unwrapped stage, and a Whisper that raises on every
+        # call -- a missing CUDA library, as it turned out -- took the whole
+        # assistant down on the first wake word rather than one command.
+        try:
+            transcription = transcriber.transcribe_bytes(audio_to_transcribe)
+        except Exception as e:
+            print(f"[main] transcribe failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            transcription = ""
+        clock.lap("transcribe")
+        print(f"[main] User said: {transcription}")
+        panel.heard(transcription)
+
+        if transcription.strip():
+            answer = reply(agent, transcription)
+            clock.lap("action")
+            panel.state("speaking")
+            panel.replied(answer)
+            tts.speak(answer)
+        else:
+            clock.lap("action")
+            panel.state("speaking")
+            panel.replied(NOT_HEARD)
+            tts.speak(NOT_HEARD)
+        clock.lap("speak")
+
+        # Last thing in the turn, and wrapped: a broken log must cost the
+        # measurement, never the assistant. Everything above has already
+        # happened by now -- he has his answer.
+        try:
+            measure.log(
+                {
+                    "trigger": trigger,
+                    "stages": clock.stages,
+                    "total_ms": clock.total(),
+                    # First word to last -- not the length of the recording,
+                    # which also holds the gap before he started and the hang
+                    # at the end. Both of those are silence he waited through,
+                    # and counting them here shortened the reported wait by
+                    # about a second, in the flattering direction. Named for
+                    # what it is, because "heard" read as "recorded" once
+                    # already and cost exactly that.
+                    "spoke_ms": round(spoke * 1000),
+                    "transcript": transcription.strip()[:200],
+                }
+            )
+        except Exception as e:
+            print(f"[main] voice log failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+
+        # Clear rolling buffer
+        buffer.clear()
+        # The detector scores a rolling window, so the tail of the phrase is
+        # still inside it; on the hotkey path nothing reset it at all.
+        detector.reset()
+        # And drop whatever the callback queued between the trigger and the
+        # stream closing. That audio is the tail of "hey jarvis" plus the
+        # command itself, and handing it back to the detector can start a
+        # second turn on words already answered.
+        while not q_in.empty():
+            q_in.get_nowait()
+
+        panel.state("idle")
+        # Restart mic after all TTS is done
+        start_stream()
+
     # Start the mic initially
     start_stream()
+    panel.state("idle")
+    print(f"[main] Say {wakeword.PHRASE!r}, or press Right Ctrl.")
 
     # Peak score of whatever he just said, while it stays above NOTICE. Printed
     # once when it falls back, so a near miss is one line per attempt rather
@@ -160,113 +288,30 @@ def main():
 
     try:
         while True:
-            data_bytes = q_in.get()
+            # A timeout rather than a blocking get, so Tk gets this thread
+            # between audio blocks and the hotkey is polled even in a silent
+            # room. Blocking here froze the panel until somebody spoke, which
+            # is the one moment a status readout has to be alive.
+            try:
+                data_bytes = q_in.get(timeout=0.05)
+            except queue.Empty:
+                panel.pump()
+                if key.pressed():
+                    take_turn("hotkey")
+                continue
 
-            if detector.heard(data_bytes):
+            panel.level(vad.rms(data_bytes))
+
+            # The key is checked first on purpose: it is the deliberate signal,
+            # and it should win over a wake word that happens to score on the
+            # same block.
+            if key.pressed():
+                take_turn("hotkey")
+            elif detector.heard(data_bytes):
                 near_peak = 0.0
                 print(f"[wakeword] heard {wakeword.PHRASE!r} "
                       f"(score {detector.last_score:.2f})")
-                clock = Stopwatch()
-
-                # Stop mic so TTS doesn't leak into audio
-                stop_stream()
-                clock.lap("teardown")
-
-                # Measured before the acknowledgement, off the whole
-                # buffer: ten seconds of the actual room is a better
-                # sample of it than anything measurable after. Both levels
-                # come from the same audio because it holds both -- room,
-                # ending in the wake word.
-                floor, loud = vad.levels(buffer.get_audio(), SAMPLERATE)
-                level = vad.threshold(floor, loud)
-                clock.lap("calibrate")
-                # Printed because "it didn't hear me" and "it never stopped
-                # recording" are one symptom from the outside and opposite
-                # numbers here. "(floor)" means the room measured quieter
-                # than MIN_RMS, so the threshold is the hard minimum rather
-                # than anything this room told us.
-                print(
-                    f"[vad] room {floor:.0f}, voice {loud:.0f}, "
-                    f"speech above {level:.0f}"
-                    + (" (floor)" if level == vad.MIN_RMS else "")
-                )
-
-                tts.speak(ACK)
-                clock.lap("ack")
-
-                command, spoke = record_command(level)
-                clock.lap("capture")
-                recorded = len(command) / (SAMPLERATE * 2)
-                print(f"[vad] recorded {recorded:.1f}s, {spoke:.1f}s of speech")
-
-                # A short pre-roll, in case he ran into the command before the
-                # acknowledgement finished. It is no longer where the command
-                # lives -- see PRE_ROLL_SEC -- and the wake phrase itself lands
-                # in here, which handlers._normalise strips back out.
-                audio_to_transcribe = buffer.tail(PRE_ROLL_SEC) + command
-
-                # Transcribe. Wrapped for the same reason reply() is: this
-                # loop is meant to survive from login to shutdown, so a
-                # bad turn costs a turn. It was the one unwrapped stage,
-                # and a Whisper that raises on every call -- a missing CUDA
-                # library, as it turned out -- took the whole assistant
-                # down on the first wake word rather than one command.
-                try:
-                    transcription = transcriber.transcribe_bytes(audio_to_transcribe)
-                except Exception as e:
-                    print(f"[main] transcribe failed: {type(e).__name__}: {e}",
-                          file=sys.stderr)
-                    transcription = ""
-                clock.lap("transcribe")
-                print(f"[main] User said: {transcription}")
-
-                if transcription.strip():
-                    answer = reply(agent, transcription)
-                    clock.lap("action")
-                    tts.speak(answer)
-                else:
-                    clock.lap("action")
-                    tts.speak(NOT_HEARD)
-                clock.lap("speak")
-
-                # Last thing in the turn, and wrapped: a broken log must
-                # cost the measurement, never the assistant. Everything
-                # above has already happened by now -- he has his answer.
-                try:
-                    measure.log(
-                        {
-                            "stages": clock.stages,
-                            "total_ms": clock.total(),
-                            # First word to last -- not the length of the
-                            # recording, which also holds the gap before he
-                            # started and the hang at the end. Both of those
-                            # are silence he waited through, and counting
-                            # them here shortened the reported wait by about
-                            # a second, in the flattering direction. Named
-                            # for what it is, because "heard" read as
-                            # "recorded" once already and cost exactly that.
-                            "spoke_ms": round(spoke * 1000),
-                            "transcript": transcription.strip()[:200],
-                        }
-                    )
-                except Exception as e:
-                    print(f"[main] voice log failed: {type(e).__name__}: {e}",
-                          file=sys.stderr)
-
-                # Clear rolling buffer
-                buffer.clear()
-                # And drop whatever the callback queued between the wake word
-                # firing and the stream closing. That audio is the tail of
-                # "hey jarvis" plus the command itself, and handing it back to
-                # the detector can start a second turn on words already
-                # answered. The detector resets itself on a hit; this is the
-                # queue in front of it.
-                while not q_in.empty():
-                    q_in.get_nowait()
-
-                # Restart mic after all TTS is done
-                start_stream()
-
+                take_turn("wake word")
             elif detector.last_score >= wakeword.NOTICE:
                 near_peak = max(near_peak, detector.last_score)
             elif near_peak:
@@ -278,6 +323,7 @@ def main():
         print("[main] Exiting.")
     finally:
         stop_stream()
+        panel.close()
 
 
 def record_command(level):
